@@ -44,6 +44,8 @@ The Payment Service is a dedicated internal microservice that centralizes all pa
                └───────────────────┘
 ```
 
+> **Note on the bonus code**: the diagram above is the production architecture. The bonus TypeScript skeleton in `code/` implements the database, idempotency, and webhook-handling pieces for real, but stubs the Work Queue (in-memory array instead of SQS/AMQP) and does not implement the Event Bus at all. See the "Design vs. bonus code" table in the [root README](../README.md) for the full breakdown of what's real vs. simplified.
+
 ## Key Design Choices
 
 ### 1. Hybrid Sync/Async API

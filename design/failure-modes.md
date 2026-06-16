@@ -26,6 +26,8 @@
 
 **Alternative scenario**: if the worker crashes *before* calling Stripe, the re-delivery results in a fresh Stripe call with the same idempotency key — same outcome.
 
+> **Bonus code gap**: this scenario assumes a durable queue (SQS/RabbitMQ) that re-delivers jobs after a crash via visibility timeout, and an outbox relay that recovers jobs that were written to the DB but never made it into the queue. The running TypeScript skeleton has neither — `queue.ts` is an in-memory array, and `payment-service.ts` enqueues directly rather than via an outbox relay. A crash in the bonus code **does** lose any payment stuck in `pending` with no corresponding in-memory job. See the "Design vs. bonus code" table in the [root README](../README.md).
+
 ---
 
 ## 3. Stripe Returns 200 but Webhook Never Arrives (Missed Webhook)
@@ -80,6 +82,8 @@ The second webhook returns `200 OK` without re-processing. The status update is 
 - In-flight queue jobs: visibility timeout expires → re-queued → processed after restart. No data loss.
 - New charge requests from consumers: fail with 503. Consumers should retry with the same idempotency key.
 - Webhooks from Stripe: Stripe retries webhook delivery for up to 3 days with exponential backoff. No events lost.
+
+> **Bonus code gap**: same caveat as scenario 2 — in-flight jobs in the bonus code live only in a process-local array, so a crash drops them (the `payments` row remains correctly at `pending` in MySQL, but nothing resumes it). The webhook-retry guarantee holds regardless, since that's Stripe's behavior, not ours.
 
 ---
 

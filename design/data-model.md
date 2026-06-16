@@ -2,6 +2,8 @@
 
 All tables live in Postgres. The `payments` table is the **single source of truth** for payment state. Stripe is an external system we sync against, not the source of truth.
 
+> **Note on the bonus code**: the running TypeScript skeleton in `code/` uses **MySQL** instead of Postgres — a pragmatic substitution made after this doc was written, purely so the data is browsable in Sequel Ace. The schema in [code/schema.sql](../code/schema.sql) is a direct port (`JSONB`→`JSON`, `now()`→`CURRENT_TIMESTAMP(3)`, etc.); the table shapes, constraints, and semantics below are unchanged. Postgres remains the production recommendation — better JSON indexing (`GIN`), and `SELECT ... FOR UPDATE SKIP LOCKED` is a cleaner primitive for safe concurrent job claiming than the MySQL equivalent.
+
 ---
 
 ## `payments`
