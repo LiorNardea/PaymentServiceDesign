@@ -27,12 +27,12 @@ Claude did not make the architectural decisions — those are mine. The AI accel
 └── code/                       # Bonus: TypeScript skeleton
     ├── package.json
     ├── tsconfig.json
+    ├── schema.sql               # Postgres schema (matches design/data-model.md)
     └── src/
         ├── types.ts
-        ├── db.ts               # In-memory DB stub
+        ├── db.ts               # Postgres-backed store (pg pool)
         ├── stripe-mock.ts      # Stripe mock
         ├── queue.ts            # In-process queue stub
-        ├── idempotency.ts      # Idempotency key store
         ├── payment-service.ts  # Core service logic
         ├── worker.ts           # Queue consumer / Stripe caller
         ├── webhook-handler.ts  # Stripe webhook processing
@@ -41,6 +41,18 @@ Claude did not make the architectural decisions — those are mine. The AI accel
 
 ## Quick Start (Bonus Code)
 
+Requires a local Postgres instance (matches the `payments` / `outbox` / `stripe_webhook_events` schema in [design/data-model.md](design/data-model.md)):
+
+```bash
+# one-time setup
+brew install postgresql@16
+brew services start postgresql@16
+createdb payment_service
+psql -d payment_service -f code/schema.sql
+```
+
+By default the app connects to `postgresql://localhost:5432/payment_service`. Override with `DATABASE_URL` if needed.
+
 ```bash
 cd code
 npm install
@@ -48,6 +60,10 @@ npm run dev        # starts on :3000
 # or
 npm run build && npm start
 ```
+
+### Inspecting the data
+
+Connect with Sequel Ace, TablePlus, or `psql` to `payment_service` on `localhost:5432` (no password by default with Homebrew's Postgres) to watch rows land in `payments`, `outbox`, and `stripe_webhook_events` in real time as you exercise the API.
 
 ### Try it
 

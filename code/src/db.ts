@@ -1,82 +1,147 @@
 /**
- * In-memory store standing in for Postgres.
- * Real implementation would use pg / Prisma / Drizzle with proper transactions.
+ * Postgres-backed store. Schema: ../schema.sql
+ * Connects to a local Postgres instance (DATABASE_URL env var, defaults below).
  */
+import { Pool } from 'pg';
 import { Payment, OutboxEntry } from './types';
 
-class InMemoryDb {
-  private payments = new Map<string, Payment>();
-  // idempotency index: `${consumerId}:${idempotencyKey}` -> paymentId
-  private idempotencyIndex = new Map<string, string>();
-  private outbox = new Map<string, OutboxEntry>();
-  private processedWebhookEvents = new Set<string>();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL ?? 'postgresql://localhost:5432/payment_service',
+});
 
-  // ---------- payments ----------
+function rowToPayment(row: any): Payment {
+  return {
+    id: row.id,
+    consumerId: row.consumer_id,
+    idempotencyKey: row.idempotency_key,
+    customerId: row.customer_id,
+    amount: row.amount,
+    currency: row.currency,
+    description: row.description ?? undefined,
+    metadata: row.metadata ?? undefined,
+    status: row.status,
+    stripePiId: row.stripe_pi_id ?? undefined,
+    failureReason: row.failure_reason ?? undefined,
+    parentPaymentId: row.parent_payment_id ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
-  insertPayment(payment: Payment): Payment {
-    const idemKey = `${payment.consumerId}:${payment.idempotencyKey}`;
-    if (this.idempotencyIndex.has(idemKey)) {
-      // Simulate the unique-constraint conflict: return existing
-      const existingId = this.idempotencyIndex.get(idemKey)!;
-      return this.payments.get(existingId)!;
+class PostgresDb {
+  async insertPayment(payment: Payment): Promise<Payment> {
+    try {
+      const res = await pool.query(
+        `INSERT INTO payments
+          (id, consumer_id, idempotency_key, customer_id, amount, currency, description, metadata, status, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         RETURNING *`,
+        [
+          payment.id,
+          payment.consumerId,
+          payment.idempotencyKey,
+          payment.customerId,
+          payment.amount,
+          payment.currency,
+          payment.description ?? null,
+          payment.metadata ?? null,
+          payment.status,
+          payment.createdAt,
+          payment.updatedAt,
+        ],
+      );
+      return rowToPayment(res.rows[0]);
+    } catch (err: any) {
+      // unique_violation on (consumer_id, idempotency_key) -> idempotent replay
+      if (err.code === '23505') {
+        const existing = await pool.query(
+          `SELECT * FROM payments WHERE consumer_id = $1 AND idempotency_key = $2`,
+          [payment.consumerId, payment.idempotencyKey],
+        );
+        return rowToPayment(existing.rows[0]);
+      }
+      throw err;
     }
-    this.payments.set(payment.id, payment);
-    this.idempotencyIndex.set(idemKey, payment.id);
-    return payment;
   }
 
-  getPayment(id: string): Payment | undefined {
-    return this.payments.get(id);
+  async getPayment(id: string): Promise<Payment | undefined> {
+    const res = await pool.query(`SELECT * FROM payments WHERE id = $1`, [id]);
+    return res.rows[0] ? rowToPayment(res.rows[0]) : undefined;
   }
 
   /**
    * Conditional update — only proceeds if current status matches expectedStatus.
-   * Simulates `UPDATE payments SET ... WHERE id=$id AND status=$expected`.
+   * Returns true if a row was updated.
    */
-  updatePaymentStatus(
+  async updatePaymentStatus(
     id: string,
     expectedStatus: Payment['status'],
     patch: Partial<Payment>,
-  ): boolean {
-    const p = this.payments.get(id);
-    if (!p || p.status !== expectedStatus) return false;
-    const updated = { ...p, ...patch, updatedAt: new Date() };
-    this.payments.set(id, updated);
-    return true;
+  ): Promise<boolean> {
+    const res = await pool.query(
+      `UPDATE payments
+       SET status = $1,
+           stripe_pi_id = COALESCE($2, stripe_pi_id),
+           failure_reason = COALESCE($3, failure_reason),
+           updated_at = now()
+       WHERE id = $4 AND status = $5`,
+      [patch.status, patch.stripePiId ?? null, patch.failureReason ?? null, id, expectedStatus],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
-  forceUpdatePayment(id: string, patch: Partial<Payment>): void {
-    const p = this.payments.get(id);
-    if (!p) return;
-    this.payments.set(id, { ...p, ...patch, updatedAt: new Date() });
+  async forceUpdatePayment(id: string, patch: Partial<Payment>): Promise<void> {
+    await pool.query(
+      `UPDATE payments
+       SET status = COALESCE($1, status),
+           stripe_pi_id = COALESCE($2, stripe_pi_id),
+           failure_reason = COALESCE($3, failure_reason),
+           updated_at = now()
+       WHERE id = $4`,
+      [patch.status ?? null, patch.stripePiId ?? null, patch.failureReason ?? null, id],
+    );
   }
 
-  getPaymentsByStatus(status: Payment['status']): Payment[] {
-    return [...this.payments.values()].filter(p => p.status === status);
+  async getPaymentsByStatus(status: Payment['status']): Promise<Payment[]> {
+    const res = await pool.query(`SELECT * FROM payments WHERE status = $1`, [status]);
+    return res.rows.map(rowToPayment);
   }
 
   // ---------- outbox ----------
 
-  insertOutboxEntry(entry: OutboxEntry): void {
-    this.outbox.set(entry.id, entry);
+  async insertOutboxEntry(entry: OutboxEntry): Promise<void> {
+    await pool.query(
+      `INSERT INTO outbox (id, payment_id, payload, created_at) VALUES ($1,$2,$3,$4)`,
+      [entry.id, entry.paymentId, entry.payload, entry.createdAt],
+    );
   }
 
-  getPendingOutboxEntries(): OutboxEntry[] {
-    return [...this.outbox.values()].filter(e => !e.enqueuedAt);
+  async getPendingOutboxEntries(): Promise<OutboxEntry[]> {
+    const res = await pool.query(`SELECT * FROM outbox WHERE enqueued_at IS NULL`);
+    return res.rows.map(r => ({
+      id: r.id,
+      paymentId: r.payment_id,
+      payload: r.payload,
+      enqueuedAt: r.enqueued_at ?? undefined,
+      createdAt: r.created_at,
+    }));
   }
 
-  markOutboxEnqueued(id: string): void {
-    const e = this.outbox.get(id);
-    if (e) this.outbox.set(id, { ...e, enqueuedAt: new Date() });
+  async markOutboxEnqueued(id: string): Promise<void> {
+    await pool.query(`UPDATE outbox SET enqueued_at = now() WHERE id = $1`, [id]);
   }
 
   // ---------- webhook dedup ----------
 
-  markWebhookProcessed(stripeEventId: string): boolean {
-    if (this.processedWebhookEvents.has(stripeEventId)) return false;
-    this.processedWebhookEvents.add(stripeEventId);
-    return true;
+  async markWebhookProcessed(stripeEventId: string, eventType = 'unknown'): Promise<boolean> {
+    const res = await pool.query(
+      `INSERT INTO stripe_webhook_events (stripe_event_id, event_type)
+       VALUES ($1, $2)
+       ON CONFLICT (stripe_event_id) DO NOTHING`,
+      [stripeEventId, eventType],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 }
 
-export const db = new InMemoryDb();
+export const db = new PostgresDb();

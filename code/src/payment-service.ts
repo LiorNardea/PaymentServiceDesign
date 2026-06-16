@@ -7,7 +7,7 @@ import { CreatePaymentRequest, CreateRefundRequest, Payment } from './types';
 import { db } from './db';
 import { queue } from './queue';
 
-export function createPayment(req: CreatePaymentRequest): Payment {
+export async function createPayment(req: CreatePaymentRequest): Promise<Payment> {
   const id = `pay_${ulid()}`;
   const now = new Date();
 
@@ -26,18 +26,16 @@ export function createPayment(req: CreatePaymentRequest): Payment {
   };
 
   // Atomic write: in production this is a single DB transaction that also
-  // inserts an outbox row. Here we simulate with sequential in-memory ops.
-  const inserted = db.insertPayment(payment);
+  // inserts an outbox row.
+  const inserted = await db.insertPayment(payment);
 
-  // If inserted === payment, this is a new record. If it returned an existing
-  // payment, the idempotency key was already used — return the existing one.
+  // If inserted.id !== id, the idempotency key was already used — return existing.
   if (inserted.id !== id) {
-    // idempotency hit: return existing record without enqueuing
     return inserted;
   }
 
   // Write outbox entry (in production: same transaction as insertPayment)
-  db.insertOutboxEntry({
+  await db.insertOutboxEntry({
     id: ulid(),
     paymentId: id,
     payload: { type: 'charge', paymentId: id },
@@ -52,24 +50,24 @@ export function createPayment(req: CreatePaymentRequest): Payment {
   return inserted;
 }
 
-export function getPayment(id: string): Payment | undefined {
+export async function getPayment(id: string): Promise<Payment | undefined> {
   return db.getPayment(id);
 }
 
-export function createRefund(paymentId: string, req: CreateRefundRequest): Payment {
-  const payment = db.getPayment(paymentId);
+export async function createRefund(paymentId: string, req: CreateRefundRequest): Promise<Payment> {
+  const payment = await db.getPayment(paymentId);
   if (!payment) throw new Error(`Payment ${paymentId} not found`);
   if (payment.status !== 'succeeded') {
     throw new Error(`Cannot refund payment in status: ${payment.status}`);
   }
 
   // Atomic transition: succeeded → refund_pending
-  const moved = db.updatePaymentStatus(paymentId, 'succeeded', {
+  const moved = await db.updatePaymentStatus(paymentId, 'succeeded', {
     status: 'refund_pending',
   });
   if (!moved) throw new Error('Payment status changed concurrently — retry');
 
-  db.insertOutboxEntry({
+  await db.insertOutboxEntry({
     id: ulid(),
     paymentId,
     payload: { type: 'refund', paymentId, idempotencyKey: req.idempotencyKey },
@@ -79,5 +77,5 @@ export function createRefund(paymentId: string, req: CreateRefundRequest): Payme
   queue.enqueue(paymentId, 'refund');
   console.log(`[payment-service] refund enqueued for ${paymentId}`);
 
-  return db.getPayment(paymentId)!;
+  return (await db.getPayment(paymentId))!;
 }

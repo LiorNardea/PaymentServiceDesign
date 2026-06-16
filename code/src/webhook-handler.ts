@@ -11,7 +11,7 @@ interface StripeWebhookEvent {
   data: { object: Record<string, unknown> };
 }
 
-export function handleStripeWebhook(req: Request, res: Response): void {
+export async function handleStripeWebhook(req: Request, res: Response): Promise<void> {
   // In production: verify Stripe-Signature header with stripe.webhooks.constructEvent()
   const event = req.body as StripeWebhookEvent;
 
@@ -21,7 +21,7 @@ export function handleStripeWebhook(req: Request, res: Response): void {
   }
 
   // Idempotency: if already processed, return 200 immediately
-  const isNew = db.markWebhookProcessed(event.id);
+  const isNew = await db.markWebhookProcessed(event.id, event.type);
   if (!isNew) {
     console.log(`[webhook] ${event.id} already processed — skipping`);
     res.status(200).json({ received: true });
@@ -29,7 +29,7 @@ export function handleStripeWebhook(req: Request, res: Response): void {
   }
 
   try {
-    processEvent(event);
+    await processEvent(event);
     res.status(200).json({ received: true });
   } catch (err) {
     console.error('[webhook] processing error:', err);
@@ -38,14 +38,14 @@ export function handleStripeWebhook(req: Request, res: Response): void {
   }
 }
 
-function processEvent(event: StripeWebhookEvent): void {
+async function processEvent(event: StripeWebhookEvent): Promise<void> {
   const obj = event.data.object;
 
   switch (event.type) {
     case 'payment_intent.succeeded': {
       const paymentId = obj['metadata'] && (obj['metadata'] as Record<string, string>)['paymentId'];
       if (!paymentId) break;
-      const moved = db.updatePaymentStatus(paymentId as string, 'processing', { status: 'succeeded' });
+      const moved = await db.updatePaymentStatus(paymentId as string, 'processing', { status: 'succeeded' });
       console.log(`[webhook] payment_intent.succeeded → payment ${paymentId} ${moved ? 'succeeded' : 'already updated'}`);
       break;
     }
@@ -54,7 +54,7 @@ function processEvent(event: StripeWebhookEvent): void {
       const paymentId = obj['metadata'] && (obj['metadata'] as Record<string, string>)['paymentId'];
       const reason = (obj['last_payment_error'] as Record<string, string> | undefined)?.['message'] ?? 'unknown';
       if (!paymentId) break;
-      db.updatePaymentStatus(paymentId as string, 'processing', { status: 'failed', failureReason: reason });
+      await db.updatePaymentStatus(paymentId as string, 'processing', { status: 'failed', failureReason: reason });
       console.log(`[webhook] payment_intent.payment_failed → payment ${paymentId} failed: ${reason}`);
       break;
     }
@@ -63,13 +63,13 @@ function processEvent(event: StripeWebhookEvent): void {
       const piId = obj['payment_intent'] as string | undefined;
       if (!piId) break;
       // Look up payment by Stripe PI id
-      const allProcessing = db.getPaymentsByStatus('refund_pending');
-      const payment = allProcessing.find(p => p.stripePiId === piId);
+      const allRefundPending = await db.getPaymentsByStatus('refund_pending');
+      const payment = allRefundPending.find(p => p.stripePiId === piId);
       if (!payment) {
         console.warn(`[webhook] charge.refunded: no payment found for PI ${piId}`);
         break;
       }
-      db.forceUpdatePayment(payment.id, { status: 'refunded' });
+      await db.forceUpdatePayment(payment.id, { status: 'refunded' });
       console.log(`[webhook] charge.refunded → payment ${payment.id} refunded`);
       break;
     }

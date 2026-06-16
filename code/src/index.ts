@@ -1,8 +1,10 @@
 import express, { Request, Response, NextFunction } from 'express';
+import { ulid } from 'ulid';
 import { createPayment, getPayment, createRefund } from './payment-service';
 import { handleStripeWebhook } from './webhook-handler';
 import { startWorker } from './worker';
 import { stripe } from './stripe-mock';
+import { db } from './db';
 
 const app = express();
 app.use(express.json());
@@ -10,7 +12,7 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 // POST /payments — initiate a charge
 // ---------------------------------------------------------------------------
-app.post('/payments', (req: Request, res: Response) => {
+app.post('/payments', async (req: Request, res: Response) => {
   const { consumerId, idempotencyKey, customerId, amount, currency, description, metadata } = req.body;
 
   if (!consumerId || !idempotencyKey || !customerId || !amount || !currency) {
@@ -18,7 +20,7 @@ app.post('/payments', (req: Request, res: Response) => {
     return;
   }
 
-  const payment = createPayment({ consumerId, idempotencyKey, customerId, amount, currency, description, metadata });
+  const payment = await createPayment({ consumerId, idempotencyKey, customerId, amount, currency, description, metadata });
   const statusCode = payment.status === 'pending' ? 202 : 200;
   res.status(statusCode).json(payment);
 });
@@ -26,8 +28,8 @@ app.post('/payments', (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // GET /payments/:id — poll payment status
 // ---------------------------------------------------------------------------
-app.get('/payments/:id', (req: Request, res: Response) => {
-  const payment = getPayment(req.params.id);
+app.get('/payments/:id', async (req: Request, res: Response) => {
+  const payment = await getPayment(req.params.id);
   if (!payment) {
     res.status(404).json({ error: 'not found' });
     return;
@@ -38,14 +40,14 @@ app.get('/payments/:id', (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // POST /payments/:id/refund — initiate a refund
 // ---------------------------------------------------------------------------
-app.post('/payments/:id/refund', (req: Request, res: Response) => {
+app.post('/payments/:id/refund', async (req: Request, res: Response) => {
   const { idempotencyKey, amount, reason } = req.body;
   if (!idempotencyKey) {
     res.status(400).json({ error: 'idempotencyKey is required' });
     return;
   }
   try {
-    const payment = createRefund(req.params.id, { idempotencyKey, amount, reason });
+    const payment = await createRefund(req.params.id, { idempotencyKey, amount, reason });
     res.status(202).json(payment);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -73,39 +75,42 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // ---------------------------------------------------------------------------
 const PORT = process.env.PORT ?? 3000;
 
-// Wire the mock Stripe webhook callback to POST /webhooks/stripe internally
+// Wire the mock Stripe webhook callback to simulate Stripe calling our endpoint.
+// Each event gets a globally-unique id (ulid) — using Date.now() here previously caused
+// id collisions under concurrent load (multiple events landing in the same millisecond),
+// which made the dedup check in markWebhookProcessed() silently drop real events.
 stripe.registerWebhookCallback((event) => {
-  // Simulate Stripe calling our endpoint by constructing a minimal event envelope
-  const stripeEvent = {
-    id: `evt_mock_${Date.now()}`,
-    type: event.type,
-    data: event.data,
-  };
-  // Directly invoke the webhook processing logic (skips HTTP overhead in this stub)
-  const { db } = require('./db');
-  const isNew = db.markWebhookProcessed(stripeEvent.id);
-  if (!isNew) return;
+  void (async () => {
+    const stripeEvent = {
+      id: `evt_mock_${ulid()}`,
+      type: event.type,
+      data: event.data,
+    };
 
-  const obj = stripeEvent.data.object as Record<string, unknown>;
+    const isNew = await db.markWebhookProcessed(stripeEvent.id, stripeEvent.type);
+    if (!isNew) return;
 
-  if (stripeEvent.type === 'payment_intent.succeeded') {
-    const meta = obj['metadata'] as Record<string, string> | undefined;
-    const paymentId = meta?.['paymentId'];
-    if (paymentId) {
-      db.updatePaymentStatus(paymentId, 'processing', { status: 'succeeded' });
-      console.log(`[stripe-mock webhook] ${paymentId} → succeeded`);
-    }
-  } else if (stripeEvent.type === 'charge.refunded') {
-    const piId = obj['payment_intent'] as string | undefined;
-    if (piId) {
-      const allPending = db.getPaymentsByStatus('refund_pending');
-      const p = allPending.find((pay: { stripePiId?: string }) => pay.stripePiId === piId);
-      if (p) {
-        db.forceUpdatePayment(p.id, { status: 'refunded' });
-        console.log(`[stripe-mock webhook] ${p.id} → refunded`);
+    const obj = stripeEvent.data.object as Record<string, unknown>;
+
+    if (stripeEvent.type === 'payment_intent.succeeded') {
+      const meta = obj['metadata'] as Record<string, string> | undefined;
+      const paymentId = meta?.['paymentId'];
+      if (paymentId) {
+        await db.updatePaymentStatus(paymentId, 'processing', { status: 'succeeded' });
+        console.log(`[stripe-mock webhook] ${paymentId} → succeeded`);
+      }
+    } else if (stripeEvent.type === 'charge.refunded') {
+      const piId = obj['payment_intent'] as string | undefined;
+      if (piId) {
+        const allPending = await db.getPaymentsByStatus('refund_pending');
+        const p = allPending.find((pay) => pay.stripePiId === piId);
+        if (p) {
+          await db.forceUpdatePayment(p.id, { status: 'refunded' });
+          console.log(`[stripe-mock webhook] ${p.id} → refunded`);
+        }
       }
     }
-  }
+  })();
 });
 
 startWorker();
