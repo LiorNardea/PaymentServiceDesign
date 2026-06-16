@@ -1,0 +1,273 @@
+{
+  "info": {
+    "name": "Payment Service",
+    "description": "Waltz take-home assignment — Payment Service API. Covers the core flow (charge → processing → status), idempotency, refunds, webhooks, and error cases.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "paymentId", "value": "" },
+    { "key": "idempotencyKey", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Charges",
+      "item": [
+        {
+          "name": "Create Payment",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"consumerId\": \"llc-service\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"customerId\": \"cust_123\",\n  \"amount\": 5000,\n  \"currency\": \"usd\",\n  \"description\": \"LLC formation fee\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/payments", "host": ["{{baseUrl}}"], "path": ["payments"] },
+            "description": "Initiates a charge. Returns 202 with status=pending immediately; the worker processes it asynchronously via the mock Stripe client.\n\nGenerates a fresh idempotencyKey once (stored as a fixed string, not re-evaluated per request) so 'Retry Create Payment' in the Idempotency folder can reuse the exact same key."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {",
+                  "  const r = Math.random() * 16 | 0;",
+                  "  const v = c === 'x' ? r : (r & 0x3 | 0x8);",
+                  "  return v.toString(16);",
+                  "});",
+                  "pm.collectionVariables.set('idempotencyKey', 'order-' + uuid);"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('paymentId', body.id);",
+                  "pm.test('status is 202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('payment starts pending', () => pm.expect(body.status).to.eql('pending'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Payment Status",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/payments/{{paymentId}}", "host": ["{{baseUrl}}"], "path": ["payments", "{{paymentId}}"] },
+            "description": "Poll the current status of a payment. Run this a few times after Create Payment — the mock Stripe webhook fires after ~500ms, so the status should flip from pending -> processing -> succeeded."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "console.log('Current status:', pm.response.json().status);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Payment Status - Not Found",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/payments/pay_does_not_exist", "host": ["{{baseUrl}}"], "path": ["payments", "pay_does_not_exist"] },
+            "description": "Error case: unknown payment ID should return 404."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 404', () => pm.response.to.have.status(404));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Idempotency",
+      "item": [
+        {
+          "name": "Retry Create Payment (same key)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"consumerId\": \"llc-service\",\n  \"idempotencyKey\": \"{{idempotencyKey}}\",\n  \"customerId\": \"cust_123\",\n  \"amount\": 5000,\n  \"currency\": \"usd\",\n  \"description\": \"LLC formation fee\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/payments", "host": ["{{baseUrl}}"], "path": ["payments"] },
+            "description": "Run this right after 'Create Payment' WITHOUT changing {{idempotencyKey}}. Should return 200 (not 202) with the SAME payment id — proving no double charge on retry."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('status is 200 OK (not a new charge)', () => pm.response.to.have.status(200));",
+                  "pm.test('returns the same payment id', () => pm.expect(body.id).to.eql(pm.collectionVariables.get('paymentId')));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Payment - Missing Fields",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"consumerId\": \"llc-service\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/payments", "host": ["{{baseUrl}}"], "path": ["payments"] },
+            "description": "Error case: missing required fields should return 400."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 400', () => pm.response.to.have.status(400));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Refunds",
+      "item": [
+        {
+          "name": "Create Refund",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"idempotencyKey\": \"refund-{{$randomUUID}}\",\n  \"amount\": 5000,\n  \"reason\": \"customer_request\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/payments/{{paymentId}}/refund", "host": ["{{baseUrl}}"], "path": ["payments", "{{paymentId}}", "refund"] },
+            "description": "Run this only after the payment has settled to 'succeeded' (check via Get Payment Status first). Transitions succeeded -> refund_pending -> refunded."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('payment moves to refund_pending', () => pm.expect(pm.response.json().status).to.eql('refund_pending'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refund Already-Refunded Payment",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"idempotencyKey\": \"refund-{{$randomUUID}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/payments/{{paymentId}}/refund", "host": ["{{baseUrl}}"], "path": ["payments", "{{paymentId}}", "refund"] },
+            "description": "Error case: run AFTER the first refund has settled to 'refunded'. Refunding a non-succeeded payment should return 422."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 422', () => pm.response.to.have.status(422));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Webhooks (manual simulation)",
+      "item": [
+        {
+          "name": "Simulate payment_intent.succeeded",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"evt_manual_{{$randomUUID}}\",\n  \"type\": \"payment_intent.succeeded\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"pi_manual_test\",\n      \"metadata\": { \"paymentId\": \"{{paymentId}}\" }\n    }\n  }\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/webhooks/stripe", "host": ["{{baseUrl}}"], "path": ["webhooks", "stripe"] },
+            "description": "Manually simulate a Stripe webhook delivery, bypassing the mock's automatic timer. Useful for testing the webhook handler in isolation."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 200', () => pm.response.to.have.status(200));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay Same Webhook (dedup test)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"evt_manual_fixed_id_123\",\n  \"type\": \"payment_intent.succeeded\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"pi_manual_test\",\n      \"metadata\": { \"paymentId\": \"{{paymentId}}\" }\n    }\n  }\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/webhooks/stripe", "host": ["{{baseUrl}}"], "path": ["webhooks", "stripe"] },
+            "description": "Send this request TWICE in a row (same fixed event id). Both should return 200, but check server logs — the second should log 'already processed — skipping', proving webhook dedup works."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 200 both times', () => pm.response.to.have.status(200));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Webhook - Invalid Event",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"foo\": \"bar\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/webhooks/stripe", "host": ["{{baseUrl}}"], "path": ["webhooks", "stripe"] },
+            "description": "Error case: malformed event missing id/type should return 400."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('status is 400', () => pm.response.to.have.status(400));"],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
