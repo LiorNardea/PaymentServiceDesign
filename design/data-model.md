@@ -81,6 +81,8 @@ CREATE INDEX ON outbox (enqueued_at) WHERE enqueued_at IS NULL;
 
 **Why an outbox at all?** Without it: the HTTP handler inserts the payment row, then tries to enqueue — if the process crashes between those two steps, the payment is in `pending` forever with nothing processing it. The outbox makes the enqueue durable: even if the relay crashes, it re-reads un-enqueued rows on restart.
 
+**How the relay runs**: a long-running poll loop (`SELECT ... WHERE enqueued_at IS NULL LIMIT 100`, sleep ~200ms, repeat) inside its own small service or thread — **not** a scheduled cloud function on a multi-minute cron. The HTTP handler already enqueues inline on the normal path, so the relay's only job is recovering the rare case where that inline enqueue was lost to a crash; even so, a 5-minute-cron relay would mean every payment that happens to hit that gap waits up to 5 minutes before any worker even starts on it. The tight poll loop keeps that worst case down to ~200ms. The "proper" production answer for near-zero latency without polling overhead is CDC (e.g., Debezium reading the Postgres WAL and pushing inserts straight to SQS) — heavier to operate, so I didn't choose it as the default here, but it's the natural upgrade path if outbox latency ever becomes the bottleneck.
+
 ---
 
 ## `stripe_webhook_events`
