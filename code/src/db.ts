@@ -1,13 +1,13 @@
 /**
- * Postgres-backed store. Schema: ../schema.sql
- * Connects to a local Postgres instance (DATABASE_URL env var, defaults below).
+ * MySQL-backed store. Schema: ../schema.sql
+ * Connects to a local MySQL instance (DATABASE_URL env var, defaults below).
  */
-import { Pool } from 'pg';
+import mysql from 'mysql2/promise';
 import { Payment, OutboxEntry } from './types';
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL ?? 'postgresql://localhost:5432/payment_service',
-});
+const pool = mysql.createPool(
+  process.env.DATABASE_URL ?? 'mysql://root@localhost:3306/payment_service',
+);
 
 function rowToPayment(row: any): Payment {
   return {
@@ -28,14 +28,13 @@ function rowToPayment(row: any): Payment {
   };
 }
 
-class PostgresDb {
+class MySqlDb {
   async insertPayment(payment: Payment): Promise<Payment> {
     try {
-      const res = await pool.query(
+      await pool.execute(
         `INSERT INTO payments
           (id, consumer_id, idempotency_key, customer_id, amount, currency, description, metadata, status, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         RETURNING *`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [
           payment.id,
           payment.consumerId,
@@ -44,29 +43,30 @@ class PostgresDb {
           payment.amount,
           payment.currency,
           payment.description ?? null,
-          payment.metadata ?? null,
+          payment.metadata ? JSON.stringify(payment.metadata) : null,
           payment.status,
           payment.createdAt,
           payment.updatedAt,
         ],
       );
-      return rowToPayment(res.rows[0]);
+      return (await this.getPayment(payment.id))!;
     } catch (err: any) {
-      // unique_violation on (consumer_id, idempotency_key) -> idempotent replay
-      if (err.code === '23505') {
-        const existing = await pool.query(
-          `SELECT * FROM payments WHERE consumer_id = $1 AND idempotency_key = $2`,
+      // ER_DUP_ENTRY on (consumer_id, idempotency_key) -> idempotent replay
+      if (err.code === 'ER_DUP_ENTRY') {
+        const [rows] = await pool.execute(
+          `SELECT * FROM payments WHERE consumer_id = ? AND idempotency_key = ?`,
           [payment.consumerId, payment.idempotencyKey],
         );
-        return rowToPayment(existing.rows[0]);
+        return rowToPayment((rows as any[])[0]);
       }
       throw err;
     }
   }
 
   async getPayment(id: string): Promise<Payment | undefined> {
-    const res = await pool.query(`SELECT * FROM payments WHERE id = $1`, [id]);
-    return res.rows[0] ? rowToPayment(res.rows[0]) : undefined;
+    const [rows] = await pool.execute(`SELECT * FROM payments WHERE id = ?`, [id]);
+    const row = (rows as any[])[0];
+    return row ? rowToPayment(row) : undefined;
   }
 
   /**
@@ -78,47 +78,45 @@ class PostgresDb {
     expectedStatus: Payment['status'],
     patch: Partial<Payment>,
   ): Promise<boolean> {
-    const res = await pool.query(
+    const [res] = await pool.execute(
       `UPDATE payments
-       SET status = $1,
-           stripe_pi_id = COALESCE($2, stripe_pi_id),
-           failure_reason = COALESCE($3, failure_reason),
-           updated_at = now()
-       WHERE id = $4 AND status = $5`,
-      [patch.status, patch.stripePiId ?? null, patch.failureReason ?? null, id, expectedStatus],
+       SET status = ?,
+           stripe_pi_id = COALESCE(?, stripe_pi_id),
+           failure_reason = COALESCE(?, failure_reason)
+       WHERE id = ? AND status = ?`,
+      [patch.status ?? expectedStatus, patch.stripePiId ?? null, patch.failureReason ?? null, id, expectedStatus],
     );
-    return (res.rowCount ?? 0) > 0;
+    return (res as any).affectedRows > 0;
   }
 
   async forceUpdatePayment(id: string, patch: Partial<Payment>): Promise<void> {
-    await pool.query(
+    await pool.execute(
       `UPDATE payments
-       SET status = COALESCE($1, status),
-           stripe_pi_id = COALESCE($2, stripe_pi_id),
-           failure_reason = COALESCE($3, failure_reason),
-           updated_at = now()
-       WHERE id = $4`,
+       SET status = COALESCE(?, status),
+           stripe_pi_id = COALESCE(?, stripe_pi_id),
+           failure_reason = COALESCE(?, failure_reason)
+       WHERE id = ?`,
       [patch.status ?? null, patch.stripePiId ?? null, patch.failureReason ?? null, id],
     );
   }
 
   async getPaymentsByStatus(status: Payment['status']): Promise<Payment[]> {
-    const res = await pool.query(`SELECT * FROM payments WHERE status = $1`, [status]);
-    return res.rows.map(rowToPayment);
+    const [rows] = await pool.execute(`SELECT * FROM payments WHERE status = ?`, [status]);
+    return (rows as any[]).map(rowToPayment);
   }
 
   // ---------- outbox ----------
 
   async insertOutboxEntry(entry: OutboxEntry): Promise<void> {
-    await pool.query(
-      `INSERT INTO outbox (id, payment_id, payload, created_at) VALUES ($1,$2,$3,$4)`,
-      [entry.id, entry.paymentId, entry.payload, entry.createdAt],
+    await pool.execute(
+      `INSERT INTO outbox (id, payment_id, payload, created_at) VALUES (?,?,?,?)`,
+      [entry.id, entry.paymentId, JSON.stringify(entry.payload), entry.createdAt],
     );
   }
 
   async getPendingOutboxEntries(): Promise<OutboxEntry[]> {
-    const res = await pool.query(`SELECT * FROM outbox WHERE enqueued_at IS NULL`);
-    return res.rows.map(r => ({
+    const [rows] = await pool.execute(`SELECT * FROM outbox WHERE enqueued_at IS NULL`);
+    return (rows as any[]).map(r => ({
       id: r.id,
       paymentId: r.payment_id,
       payload: r.payload,
@@ -128,20 +126,23 @@ class PostgresDb {
   }
 
   async markOutboxEnqueued(id: string): Promise<void> {
-    await pool.query(`UPDATE outbox SET enqueued_at = now() WHERE id = $1`, [id]);
+    await pool.execute(`UPDATE outbox SET enqueued_at = NOW(3) WHERE id = ?`, [id]);
   }
 
   // ---------- webhook dedup ----------
 
   async markWebhookProcessed(stripeEventId: string, eventType = 'unknown'): Promise<boolean> {
-    const res = await pool.query(
-      `INSERT INTO stripe_webhook_events (stripe_event_id, event_type)
-       VALUES ($1, $2)
-       ON CONFLICT (stripe_event_id) DO NOTHING`,
-      [stripeEventId, eventType],
-    );
-    return (res.rowCount ?? 0) > 0;
+    try {
+      await pool.execute(
+        `INSERT INTO stripe_webhook_events (stripe_event_id, event_type) VALUES (?, ?)`,
+        [stripeEventId, eventType],
+      );
+      return true;
+    } catch (err: any) {
+      if (err.code === 'ER_DUP_ENTRY') return false;
+      throw err;
+    }
   }
 }
 
-export const db = new PostgresDb();
+export const db = new MySqlDb();
