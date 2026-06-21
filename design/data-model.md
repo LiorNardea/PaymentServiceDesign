@@ -36,8 +36,35 @@ CREATE INDEX ON payments (stripe_pi_id);           -- webhook lookups
 
 **Notes**:
 - `id` is a ULID (sortable, k-sortable, URL-safe). UUIDs work too; ULIDs give free time-ordering.
-- The `UNIQUE (consumer_id, idempotency_key)` constraint is the DB-level idempotency guard. A race between two identical requests hits a unique violation; the loser reads the existing row and returns it.
-- `stripe_pi_id` is `NULL` until the worker starts processing. Set by the worker atomically with the `processing` status transition.
+- `stripe_pi_id` is `NULL` until the worker starts processing. **Set by the Worker**, atomically in the same `UPDATE` that transitions status from `pending` → `processing`:
+  ```sql
+  UPDATE payments
+  SET status = 'processing', stripe_pi_id = $pi_id
+  WHERE id = $id AND status = 'pending'
+  ```
+  The Worker calls `stripe.paymentIntents.create()` first, receives the PaymentIntent ID (`pi_3Nxxx...`) in the response, then immediately writes it to the DB in this guarded update. This means `stripe_pi_id` is never `NULL` for a payment in `processing`, `succeeded`, or `failed` status — the Webhook Handler and Reconciliation job both rely on this index to look up the internal payment when Stripe sends a notification.
+
+---
+
+### Idempotency Key — ownership, derivation, and enforcement
+
+**Who supplies it**: the calling service (`llc-service`, `mortgage-service`, etc.). The Payment Service never generates it. Only the caller knows the business operation the key represents, and only the caller retries the same call — so the caller must own the key.
+
+**How to derive it**: the key must be **deterministic** — derived from stable, immutable business identifiers, never from a UUID generated at call time. A call-time UUID would be different on every retry, producing a new payment row each time instead of returning the existing one.
+
+Recommended pattern: `{caller-service}:{operation}:{stable-business-id}`
+
+| Caller | Operation | Key |
+|---|---|---|
+| `llc-service` | Charge for order `ord-123` | `llc-service:charge:ord-123` |
+| `mortgage-service` | Monthly payment, loan `loan-456`, period `2024-06` | `mortgage-service:charge:loan-456:2024-06` |
+| Any caller | Refund payment `pay_01HXYZ` | `{caller}:refund:pay_01HXYZ` |
+
+**DB-level enforcement**: `UNIQUE (consumer_id, idempotency_key)`. A concurrent or retried insert that conflicts returns `0 rows inserted`. The handler reads and returns the existing row. This is atomic — no application-level locking needed.
+
+**Stripe-level enforcement**: the Worker derives a Stripe idempotency key as `{consumer_id}:{idempotency_key}` and passes it on every Stripe API call. If the Worker retries (crash + queue redelivery), Stripe returns the same PaymentIntent result rather than creating a new charge at the card level.
+
+**What the consumer receives on a retry**: `200 OK` with the existing payment record and its current `status`. Consumers must treat this identically to the original `202 Received`.
 
 ---
 
@@ -85,7 +112,7 @@ CREATE INDEX ON outbox (enqueued_at) WHERE enqueued_at IS NULL;
 
 **How the relay runs**: a long-running poll loop (`SELECT ... WHERE enqueued_at IS NULL LIMIT 100`, sleep ~200ms, repeat) inside its own small service or thread — **not** a scheduled cloud function on a multi-minute cron. Since the relay is on the *normal* path (not just a rare-crash fallback), its poll interval directly becomes the latency every payment incurs before any worker starts on it — a 5-minute cron would add up to 5 minutes to every single charge, not just the crash-recovery case. The tight poll loop keeps that added latency down to ~200ms. The "proper" production answer for near-zero latency without polling overhead at all is CDC (e.g., Debezium reading the Postgres WAL and pushing inserts straight to SQS) — heavier to operate, so I didn't choose it as the default here, but it's the natural upgrade path if outbox latency ever becomes the bottleneck.
 
-**Note on the bonus code**: [payment-service.ts](../code/src/payment-service.ts) takes a shortcut not present in this production design — it calls `queue.enqueue()` directly, inline, right after writing the outbox row, because there's no relay process implemented in the skeleton at all. `markOutboxEnqueued()` exists in [db.ts](../code/src/db.ts) but is never called by anything — so in the running code, outbox rows are written correctly but never actually marked enqueued, demonstrating the data model without demonstrating the relay behavior.
+**Note on the bonus code**: [payment-service.ts](../code/src/payment-service.ts) takes a shortcut not present in this production design — it calls `queue.enqueue()` directly, inline, right after writing the outbox row, because there's no relay process implemented in the skeleton at all. That enqueue call now goes against real SQS (see [queue.ts](../code/src/queue.ts)), so the queue side is genuinely durable — but `markOutboxEnqueued()` in [db.ts](../code/src/db.ts) is still never called by anything, so outbox rows are written correctly but never marked enqueued, demonstrating the data model without demonstrating the relay's specific job (recovering an enqueue that never happened at all).
 
 ---
 

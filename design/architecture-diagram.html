@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Payment Service — Architecture</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #ffffff;
+    color: #1a1a2e;
+    font-size: 13px;
+    padding: 32px 24px;
+    max-width: 860px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #555;
+    margin-bottom: 28px;
+    text-align: center;
+  }
+
+  /* ── layout ────────────────────────────────── */
+
+  .diagram { display: flex; flex-direction: column; align-items: center; }
+
+  .section-label {
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: #999; margin-bottom: 6px; text-align: center;
+  }
+
+  .box-row { display: flex; gap: 12px; align-items: stretch; }
+
+  /* ── boxes ─────────────────────────────────── */
+
+  .box {
+    border-radius: 8px; padding: 10px 14px;
+    display: flex; flex-direction: column; gap: 4px;
+    min-width: 130px;
+  }
+  .box-title { font-weight: 700; font-size: 12px; }
+  .box-bullets { list-style: none; padding: 0; margin-top: 4px; }
+  .box-bullets li { font-size: 10.5px; color: #555; line-height: 1.6; }
+  .box-bullets li::before { content: "· "; }
+
+  .caller  { background: #f0f4ff; border: 1.5px solid #b8c8f8; }
+  .alb     { background: #f5f0ff; border: 1.5px solid #c8b8f8; }
+  .api     { background: #e8f5e9; border: 1.5px solid #a5d6a7; }
+  .relay   { background: #fff3e0; border: 2px solid #fb8c00; }
+  .queue   { background: #fff8e1; border: 1.5px solid #ffcc80; }
+  .worker  { background: #fce4ec; border: 1.5px solid #f48fb1; }
+  .stripe  { background: #e3f2fd; border: 1.5px solid #90caf9; }
+  .db      { background: #f3e5f5; border: 1.5px solid #ce93d8; }
+  .webhook { background: #e8f5e9; border: 1.5px solid #a5d6a7; }
+  .evtbus  { background: #fff8e1; border: 1.5px solid #ffcc80; }
+
+  /* ── badges ─────────────────────────────────── */
+
+  .scale-badge {
+    font-size: 9px; font-weight: 600;
+    padding: 2px 7px; border-radius: 10px;
+    margin-top: 5px; display: inline-block;
+  }
+  .s-m      { background: #c8e6c9; color: #2e7d32; }
+  .s-k      { background: #fce4ec; color: #880e4f; }
+  .s-shared { background: #fff9c4; color: #f57f17; }
+  .s-relay  { background: #ffe0b2; color: #e65100; }
+
+  .more-badge {
+    border-radius: 8px; padding: 8px 10px; min-width: 52px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 600; color: #bbb;
+    border: 1.5px dashed #ddd; background: transparent;
+    text-align: center; line-height: 1.4;
+  }
+
+  /* ── simple vertical arrow ───────────────────── */
+
+  .arr { display: flex; flex-direction: column; align-items: center; margin: 1px 0; }
+  .arr-line { width: 2px; background: #ccc; }
+  .arr-head { width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-top:7px solid #ccc; }
+  .arr-label { font-size: 9.5px; color: #aaa; margin-top: 1px; letter-spacing:.03em; }
+
+  /* ── queue banner ────────────────────────────── */
+
+  .queue-banner {
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: #e65100; background: #fff3e0;
+    border: 1.5px solid #ffb74d; border-radius: 20px;
+    padding: 3px 16px; margin-bottom: 4px;
+  }
+
+  /* ── relay bridge row ────────────────────────── */
+
+  .bridge-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    width: 100%;
+    margin: 2px 0;
+  }
+
+  .bridge-connector {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 3px; padding: 0 4px;
+  }
+  .bridge-line {
+    height: 2px; background: #fb8c00;
+    flex: 1;
+  }
+  .bridge-label {
+    font-size: 9px; color: #fb8c00;
+    font-weight: 600; white-space: nowrap;
+    letter-spacing: .03em;
+  }
+  .bridge-arrow-r {
+    width:0; height:0;
+    border-top:5px solid transparent;
+    border-bottom:5px solid transparent;
+    border-left:7px solid #fb8c00;
+  }
+  .bridge-arrow-l {
+    width:0; height:0;
+    border-top:5px solid transparent;
+    border-bottom:5px solid transparent;
+    border-right:7px solid #fb8c00;
+  }
+
+  /* ── legend ──────────────────────────────────── */
+
+  .legend {
+    display: flex; gap: 14px;
+    justify-content: center; margin-top: 20px; flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #666; }
+  .legend-dot  { width: 10px; height: 10px; border-radius: 3px; }
+
+  /* ── relay annotation box ────────────────────── */
+
+  .annotation {
+    font-size: 10px; color: #e65100;
+    background: #fff8f0; border: 1px dashed #fb8c00;
+    border-radius: 6px; padding: 5px 10px;
+    margin-top: 4px; text-align: center;
+    max-width: 340px;
+    line-height: 1.5;
+  }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+</style>
+</head>
+<body>
+
+<h1>Payment Service — Architecture</h1>
+
+<div class="diagram">
+
+  <!-- ① Internal callers -->
+  <div class="section-label">Internal Callers</div>
+  <div class="box-row">
+    <div class="box caller"><div class="box-title">llc-service</div></div>
+    <div class="box caller"><div class="box-title">mortgage-service</div></div>
+    <div class="box caller"><div class="box-title">appraisal-service</div></div>
+    <div class="more-badge">···</div>
+  </div>
+
+  <div class="arr"><div class="arr-line" style="height:16px"></div><div class="arr-head"></div></div>
+
+  <!-- ② ALB -->
+  <div class="box alb" style="min-width:290px; text-align:center;">
+    <div class="box-title">Load Balancer / ALB</div>
+  </div>
+
+  <!-- fan-out to API replicas -->
+  <svg width="440" height="34" viewBox="0 0 440 34" style="display:block">
+    <line x1="220" y1="0" x2="100" y2="28" stroke="#ccc" stroke-width="1.5"/>
+    <line x1="220" y1="0" x2="220" y2="28" stroke="#ccc" stroke-width="1.5"/>
+    <line x1="220" y1="0" x2="340" y2="28" stroke="#ccc" stroke-width="1.5"/>
+    <polygon points="100,28 96,20 104,20" fill="#ccc"/>
+    <polygon points="220,28 216,20 224,20" fill="#ccc"/>
+    <polygon points="340,28 336,20 344,20" fill="#ccc"/>
+  </svg>
+
+  <!-- ③ Payment API replicas -->
+  <div class="section-label">Payment API — <em>M replicas · scales with request rate</em></div>
+  <div class="box-row">
+    <div class="box api">
+      <div class="box-title">Payment API #1</div>
+      <ul class="box-bullets">
+        <li>Validate request</li>
+        <li>BEGIN TRANSACTION</li>
+        <li>INSERT payments row</li>
+        <li>INSERT outbox row</li>
+        <li>COMMIT → return 202</li>
+      </ul>
+      <span class="scale-badge s-m">Producer</span>
+    </div>
+    <div class="box api">
+      <div class="box-title">Payment API #2</div>
+      <ul class="box-bullets">
+        <li>Validate request</li>
+        <li>BEGIN TRANSACTION</li>
+        <li>INSERT payments row</li>
+        <li>INSERT outbox row</li>
+        <li>COMMIT → return 202</li>
+      </ul>
+      <span class="scale-badge s-m">Producer</span>
+    </div>
+    <div class="more-badge">···<br/>M</div>
+  </div>
+
+  <!-- fan-in to DB -->
+  <svg width="440" height="36" viewBox="0 0 440 36" style="display:block">
+    <line x1="100" y1="0" x2="220" y2="30" stroke="#ce93d8" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <line x1="220" y1="0" x2="220" y2="30" stroke="#ce93d8" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <line x1="340" y1="0" x2="220" y2="30" stroke="#ce93d8" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <polygon points="220,30 215,21 225,21" fill="#ce93d8"/>
+    <text x="265" y="20" font-size="9" fill="#b388cc">atomic DB txn</text>
+  </svg>
+
+  <!-- ④ DB + Relay bridge -->
+  <div class="bridge-row">
+
+    <!-- Payments DB -->
+    <div class="box db" style="min-width:200px;">
+      <div class="box-title">Payments DB (MySQL)</div>
+      <ul class="box-bullets">
+        <li><strong>payments</strong> table</li>
+        <li><strong>outbox</strong> table</li>
+        <li style="color:#888; font-style:italic">enqueued_at = NULL → pending</li>
+      </ul>
+      <span class="scale-badge s-shared">Shared · source of truth</span>
+    </div>
+
+    <!-- Bridge: DB ←→ Relay -->
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; padding:0 6px;">
+      <!-- poll arrow: DB → Relay -->
+      <div style="display:flex; align-items:center; gap:0;">
+        <div style="width:54px; height:2px; background:#fb8c00;"></div>
+        <div class="bridge-arrow-r"></div>
+      </div>
+      <div class="bridge-label">poll ~200 ms</div>
+      <!-- mark arrow: Relay → DB -->
+      <div class="bridge-label">mark enqueued</div>
+      <div style="display:flex; align-items:center; gap:0;">
+        <div class="bridge-arrow-l"></div>
+        <div style="width:54px; height:2px; background:#fb8c00;"></div>
+      </div>
+    </div>
+
+    <!-- Outbox Relay -->
+    <div class="box relay" style="min-width:160px;">
+      <div class="box-title">⟳ Outbox Relay</div>
+      <ul class="box-bullets">
+        <li>SELECT outbox WHERE</li>
+        <li style="padding-left:8px">enqueued_at IS NULL</li>
+        <li>sqs.sendMessage()</li>
+        <li>UPDATE outbox SET</li>
+        <li style="padding-left:8px">enqueued_at = now()</li>
+      </ul>
+      <span class="scale-badge s-relay">Only enqueue path</span>
+    </div>
+
+    <!-- Bridge: Relay → Queue -->
+    <div style="display:flex; align-items:center; padding:0 4px;">
+      <div style="width:30px; height:2px; background:#fb8c00;"></div>
+      <div class="bridge-arrow-r"></div>
+    </div>
+
+    <!-- Work Queue -->
+    <div style="display:flex; flex-direction:column; align-items:center; gap:4px;">
+      <div class="queue-banner">Many Producers → Queue ← Many Consumers</div>
+      <div class="box queue" style="min-width:170px; text-align:center;">
+        <div class="box-title">Work Queue (SQS)</div>
+        <ul class="box-bullets" style="display:flex; flex-direction:column; align-items:center;">
+          <li>Durable · shared</li>
+          <li>Visibility timeout</li>
+          <li>Dead-Letter Queue</li>
+        </ul>
+        <span class="scale-badge s-shared">Managed service</span>
+      </div>
+    </div>
+
+  </div><!-- /bridge-row -->
+
+  <div class="annotation">
+    The relay is the <strong>only</strong> path that writes to the queue.<br/>
+    API replicas never call SQS directly — the outbox row is the durable record<br/>
+    that an enqueue needs to happen, surviving any crash before the relay runs.
+  </div>
+
+  <!-- fan-out to workers -->
+  <svg width="440" height="40" viewBox="0 0 440 40" style="display:block">
+    <line x1="220" y1="0" x2="130" y2="34" stroke="#ccc" stroke-width="1.5"/>
+    <line x1="220" y1="0" x2="220" y2="34" stroke="#ccc" stroke-width="1.5"/>
+    <line x1="220" y1="0" x2="310" y2="34" stroke="#ccc" stroke-width="1.5"/>
+    <polygon points="130,34 126,25 134,25" fill="#ccc"/>
+    <polygon points="220,34 216,25 224,25" fill="#ccc"/>
+    <polygon points="310,34 306,25 314,25" fill="#ccc"/>
+    <text x="232" y="18" font-size="9" fill="#aaa">competing pull</text>
+  </svg>
+
+  <!-- ⑤ Worker replicas -->
+  <div class="section-label">Worker Service — <em>K replicas · scales with queue depth</em></div>
+  <div class="box-row">
+    <div class="box worker">
+      <div class="box-title">Worker #1</div>
+      <ul class="box-bullets">
+        <li>Semaphore N (sliding window)</li>
+        <li>UPDATE status=processing</li>
+        <li>stripe.paymentIntents.create()</li>
+        <li>deleteMessage()</li>
+        <li style="color:#aaa; font-style:italic">does NOT publish events</li>
+      </ul>
+      <span class="scale-badge s-k">Consumer</span>
+    </div>
+    <div class="box worker">
+      <div class="box-title">Worker #2</div>
+      <ul class="box-bullets">
+        <li>Semaphore N (sliding window)</li>
+        <li>UPDATE status=processing</li>
+        <li>stripe.paymentIntents.create()</li>
+        <li>deleteMessage()</li>
+        <li style="color:#aaa; font-style:italic">does NOT publish events</li>
+      </ul>
+      <span class="scale-badge s-k">Consumer</span>
+    </div>
+    <div class="more-badge">···<br/>K</div>
+  </div>
+
+  <!-- arrow to Stripe -->
+  <div class="arr">
+    <div class="arr-line" style="height:14px"></div>
+    <div class="arr-label">Stripe API calls · idempotency key per job</div>
+    <div class="arr-line" style="height:10px"></div>
+    <div class="arr-head"></div>
+  </div>
+
+  <!-- ⑥ Stripe -->
+  <div class="box stripe" style="min-width:230px; text-align:center;">
+    <div class="box-title">Stripe</div>
+  </div>
+
+  <!-- webhook arrow -->
+  <div class="arr">
+    <div class="arr-line" style="height:14px"></div>
+    <div class="arr-label">webhooks → any API replica via ALB</div>
+    <div class="arr-line" style="height:10px"></div>
+    <div class="arr-head"></div>
+  </div>
+
+  <!-- ⑦ Webhook Handler → SNS → Subscribers -->
+  <div class="section-label">Event Publishing Pipeline — sole publisher of final state</div>
+  <div class="box-row" style="align-items:flex-start;">
+
+    <!-- Webhook Handler -->
+    <div class="box webhook" style="min-width:168px;">
+      <div class="box-title">Webhook Handler</div>
+      <ul class="box-bullets">
+        <li>① Deduplicate</li>
+        <li style="padding-left:10px">ON CONFLICT DO NOTHING</li>
+        <li>② Resolve payment</li>
+        <li style="padding-left:10px">by stripe_pi_id</li>
+        <li>③ UPDATE status</li>
+        <li style="padding-left:10px">processing → succeeded</li>
+        <li style="padding-left:10px">processing → failed</li>
+        <li>④ Publish to SNS</li>
+        <li>⑤ Return 200 to Stripe</li>
+      </ul>
+      <span class="scale-badge s-m">Sole publisher</span>
+    </div>
+
+    <div style="display:flex;align-items:center;padding:0 6px; color:#ccc; font-size:18px; padding-top:40px;">→</div>
+
+    <!-- SNS Topic -->
+    <div class="box evtbus" style="min-width:168px;">
+      <div class="box-title">SNS Topic</div>
+      <ul class="box-bullets">
+        <li>PaymentStateChanged</li>
+        <li style="color:#aaa">Owned by Payment Service</li>
+        <li style="margin-top:4px">Fan-out to all</li>
+        <li>subscriber queues</li>
+      </ul>
+      <span class="scale-badge s-shared">Managed service</span>
+    </div>
+
+    <div style="display:flex;align-items:center;padding:0 6px; color:#ccc; font-size:18px; padding-top:40px;">→</div>
+
+    <!-- Subscribers -->
+    <div style="display:flex;flex-direction:column;gap:6px;">
+      <div style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#999;margin-bottom:2px;">Subscribers — each owns their SQS queue + DLQ</div>
+      <div class="box caller" style="min-width:190px; padding:8px 12px;">
+        <div class="box-title" style="font-size:11px;">llc-service</div>
+        <ul class="box-bullets">
+          <li>succeeded → mark order paid</li>
+          <li>failed → cancel / retry order</li>
+        </ul>
+      </div>
+      <div class="box caller" style="min-width:190px; padding:8px 12px;">
+        <div class="box-title" style="font-size:11px;">mortgage-service</div>
+        <ul class="box-bullets">
+          <li>succeeded → update loan ledger</li>
+          <li>failed → trigger collections</li>
+        </ul>
+      </div>
+      <div class="box caller" style="min-width:190px; padding:8px 12px; background:#f5f5f5; border-color:#ddd;">
+        <div class="box-title" style="font-size:11px;">notifications-service</div>
+        <ul class="box-bullets">
+          <li>succeeded/failed → email/SMS</li>
+        </ul>
+      </div>
+      <div class="box caller" style="min-width:190px; padding:8px 12px; background:#f5f5f5; border-color:#ddd;">
+        <div class="box-title" style="font-size:11px;">finance/audit-service</div>
+        <ul class="box-bullets">
+          <li>all events → immutable ledger</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Reconciliation Lambda -->
+  <div style="margin-top:14px; width:100%; display:flex; justify-content:center;">
+    <div style="display:flex; align-items:center; gap:8px; background:#f3f3f3; border:1.5px dashed #bbb; border-radius:8px; padding:10px 16px; max-width:640px; width:100%;">
+      <div style="font-size:18px;">⏱</div>
+      <div style="flex:1;">
+        <div style="font-weight:700; font-size:12px; margin-bottom:3px;">Reconciliation Lambda <span style="font-weight:400; color:#aaa; font-size:10px;">— EventBridge cron, every 5 min · not an always-running service</span></div>
+        <ul class="box-bullets" style="display:flex; gap:16px; flex-wrap:wrap;">
+          <li>SELECT processing &gt; 10 min</li>
+          <li>stripe.paymentIntents.retrieve(stripe_pi_id)</li>
+          <li>UPDATE final status</li>
+          <li>Publish PaymentStateChanged to SNS (fallback publisher)</li>
+          <li>Auto-cancel after 24h max-age</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="annotation" style="max-width:500px;">
+    Each subscriber filters by <strong>consumerId</strong> — ignores events belonging to other services.<br/>
+    SNS/SQS is at-least-once: subscribers must process events <strong>idempotently</strong>.<br/>
+    The <strong>Reconciliation Lambda</strong> is the fallback publisher when the Stripe webhook is missed.
+  </div>
+
+  <!-- legend -->
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#a5d6a7;border:1px solid #a5d6a7"></div>API / Webhook Handler (sole publisher)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#fb8c00;border:1px solid #fb8c00"></div>Outbox Relay (bridge)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f48fb1;border:1px solid #f48fb1"></div>Worker (does not publish)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffcc80;border:1px solid #ffcc80"></div>Shared infrastructure</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#90caf9;border:1px solid #90caf9"></div>External (Stripe)</div>
+  </div>
+
+</div><!-- /diagram -->
+</body>
+</html>

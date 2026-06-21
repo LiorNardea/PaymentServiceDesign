@@ -43,8 +43,9 @@ export async function createPayment(req: CreatePaymentRequest): Promise<Payment>
   });
 
   // In production: an outbox relay reads this entry and calls queue.enqueue().
-  // Here we call it inline for simplicity.
-  queue.enqueue(id, 'charge');
+  // Here we call it inline for simplicity — see design/data-model.md's
+  // "Note on the bonus code" for why this differs from the production design.
+  await queue.enqueue(id, 'charge');
   console.log(`[payment-service] created ${id} for ${req.consumerId}`);
 
   return inserted;
@@ -74,7 +75,7 @@ export async function createRefund(paymentId: string, req: CreateRefundRequest):
     createdAt: new Date(),
   });
 
-  queue.enqueue(paymentId, 'refund');
+  await queue.enqueue(paymentId, 'refund');
   console.log(`[payment-service] refund enqueued for ${paymentId}`);
 
   return (await db.getPayment(paymentId))!;

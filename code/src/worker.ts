@@ -90,5 +90,6 @@ async function processRefund(job: QueueJob, payment: Payment): Promise<void> {
 
 export function startWorker(): void {
   queue.registerHandler(processJob);
-  console.log('[worker] started');
+  queue.startPolling();
+  console.log('[worker] started, polling SQS');
 }

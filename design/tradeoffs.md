@@ -1,22 +1,28 @@
 # Tradeoffs
 
-## Decision 1: Synchronous Acknowledgement + Async Processing vs. Fully Synchronous
+## Decision 1: Fast Acknowledgement vs. Immediate Outcome ("Received" vs. "Approved/Declined")
 
-**What I chose**: The HTTP handler returns `202 Accepted` with a `paymentId` immediately. The actual Stripe call happens asynchronously via a worker queue.
+**The core trade-off**: we consciously split the response into two separate moments:
+- **Received** (~20ms) — `202 Received` + `paymentId`. "We have your request, it will be processed." This is what the HTTP response confirms.
+- **Approved / Declined** (1–6s later) — the final outcome, delivered via SNS event (`PaymentStateChanged`) or poll (`GET /payments/:id`).
 
-**What I rejected**: Making the HTTP call wait for the Stripe response before returning.
+Callers get a fast, reliable acknowledgement immediately. They learn the outcome asynchronously. We prioritized **fast acknowledgement over immediate outcome**.
 
-**Why I chose async**:
-- Stripe can take 1–5 seconds under load; holding HTTP connections open for 500 concurrent requests during burst creates a thundering-herd problem.
-- Queue provides natural flow control and retry without burdening the API tier.
-- Consumers can poll or subscribe to events; they don't need to hold a connection open.
+**What I chose**: The HTTP handler returns `202 Received` with a `paymentId` immediately. The actual Stripe call happens asynchronously via a worker queue.
+
+**What I rejected**: Making the HTTP call wait for the Stripe response before returning a `200 OK` with the final charge result.
+
+**Why**:
+- Stripe can take 1–5 seconds under load. Holding HTTP connections open for 500 concurrent requests during a burst creates a thundering-herd problem — threads blocked on Stripe, connection pool exhausted, new requests timing out.
+- The queue provides natural flow control and burst absorption. Callers don't need to hold a connection open for the duration of a Stripe call.
+- This is how real-world payment systems work — ACH, PayPal, and Stripe's own async payment intents all use the same two-moment model. Callers in fintech already understand "received ≠ approved."
 
 **What I gave up**:
-- Simplicity. A synchronous design is much easier to reason about. You call Stripe, you get an answer, you return it.
-- Immediate feedback. The consumer gets `pending` and must handle async state. This adds complexity to consumer code.
-- Latency for small loads. When there's no burst, the async path adds unnecessary roundtrips.
+- **Simplicity.** A synchronous design is much easier to reason about: call Stripe, get an answer, return it. One moment, not two.
+- **Immediate outcome.** Callers must be designed to handle two moments — received and approved/declined — and must not take irreversible business actions (send a receipt, provision a service) between them. This adds complexity to every consumer.
+- **Latency for small loads.** When there is no burst, the async path adds an unnecessary relay hop (~200ms) before any Stripe call happens.
 
-**When I'd reconsider**: if Stripe were fast and reliable (< 200ms p99) and the traffic pattern were smooth, I'd go fully synchronous. For burst-heavy fintech workloads, async is worth the complexity.
+**When I'd reconsider**: if Stripe were fast and reliable (< 200ms p99) and traffic were smooth and predictable, the synchronous design is simpler and arguably better — one moment is easier for callers to handle than two. For burst-heavy fintech workloads, the two-moment model is worth the added consumer complexity.
 
 ---
 
@@ -44,13 +50,33 @@
 
 **What I rejected**: Checking "does this idempotency key exist?" in application code before inserting.
 
-**Why I chose DB constraint**:
-- Races. Two concurrent requests with the same key arrive simultaneously. An application-level read-then-write has a TOCTOU window; both reads return "not found" and both inserts proceed. The DB constraint collapses this to a single winner with a conflict error.
-- Simplicity. No locking, no distributed mutex, no Redis-based lock. The DB handles it.
+**Why I chose DB constraint — mutual exclusion**:
+
+The DB `UNIQUE` constraint provides **mutual exclusion** at the storage engine level. The engine enforces uniqueness atomically as part of the `INSERT` operation itself, inside the transaction. This means two concurrent requests with the same key cannot both succeed — regardless of how many application processes or threads are running. One wins, one gets a conflict error. There is no window between check and write.
+
+The application-level alternative — read-then-write — has a classic **TOCTOU (Time Of Check, Time Of Use)** race:
+```
+Thread A: SELECT → "not found"
+Thread B: SELECT → "not found"   ← both read before either writes
+Thread A: INSERT → succeeds
+Thread B: INSERT → also succeeds  ← duplicate payment row, potential double charge
+```
+
+The DB constraint collapses this to a single atomic operation. The engine is the mutex — no application-level locking, no distributed lock (Redis `SETNX`), no coordination between service instances needed.
+
+**What the application does on conflict:**
+```
+try {
+  INSERT INTO payments (consumer_id, idempotency_key, ...)
+} catch (UniqueConstraintError) {
+  SELECT * FROM payments WHERE consumer_id = ? AND idempotency_key = ?
+  → return existing row with current status   // idempotent response
+}
+```
 
 **What I gave up**:
-- Transparency. A unique constraint violation is a blunt error; the handler must catch and distinguish "idempotency duplicate" from other errors.
-- Coupling. The idempotency logic is tied to the DB schema. If I wanted to support idempotency across a distributed multi-region setup without a shared DB, I'd need a different approach (e.g., a dedicated idempotency store like Redis with `SETNX`).
+- Transparency. A unique constraint violation is a blunt error; the handler must catch it and distinguish "idempotency duplicate" from other constraint violations (e.g. a foreign key error).
+- Multi-region portability. This mutual exclusion relies on a single shared Postgres primary. In a distributed multi-region setup without a shared DB, a different approach is needed — e.g. a dedicated idempotency store (Redis `SETNX` with a TTL, or a global DynamoDB conditional write). The DB constraint is the right choice here because we already have a single shared Postgres instance as the source of truth.
 
 ---
 
