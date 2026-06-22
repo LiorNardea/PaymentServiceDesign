@@ -112,3 +112,33 @@ try {
 **What I gave up**:
 - Two integration paths to maintain. Consumers must choose and implement one (or both).
 - Operational complexity: the event bus (SNS + SQS per consumer) must be provisioned and monitored.
+
+---
+
+## Decision 6: Idempotency Key Ownership — Trust Callers vs. Enforce via SDK
+
+**The dilemma**: the Payment Service requires callers to supply an idempotency key derived from a stable business ID (e.g. `llc-service:charge:ord-123`). If a caller accidentally generates a random UUID on every attempt, the Payment Service cannot detect it — each retry looks like a new request, and the customer gets charged multiple times. The Payment Service cannot know the caller's business logic well enough to validate the key's stability.
+
+**What I chose**: trust internal callers + publish an internal SDK.
+
+The Payment Service enforces two things it *can* enforce:
+1. The key is **present** — `400` if missing
+2. The key is **scoped per consumer** — `UNIQUE(consumer_id, idempotency_key)` prevents cross-service collisions
+
+Whether the key is *correctly derived* is delegated to the caller — but mitigated by providing an internal SDK that owns the derivation:
+
+```ts
+// Caller cannot get key derivation wrong
+paymentClient.charge({ orderId: 'ord-123', amount: 5000 });
+// SDK derives internally: "llc-service:charge:ord-123"
+```
+
+**What I rejected**: building server-side heuristics to detect unstable keys (e.g. flagging two requests with the same amount/customer/description but different keys within a short window). This would require the Payment Service to understand each caller's business semantics — which it explicitly does not. The heuristic would produce false positives and add complexity for a problem better solved at the integration layer.
+
+**Why trust is reasonable here**: callers are internal services owned by the same engineering organization, not external third parties. The contract is documented, code-reviewed when callers integrate, and enforced structurally by the SDK. This is the same model Stripe uses — they document the idempotency key convention and trust their customers to follow it.
+
+**What I gave up**:
+- A caller that ignores the SDK and calls the REST API directly with a random key will silently produce duplicate charges. There is no server-side safety net for this case.
+- The SDK must be maintained and kept in sync with the API as it evolves — another artifact to own.
+
+**When I'd reconsider**: if the Payment Service were exposed to external third-party developers (not just internal services), trust alone would be insufficient. In that case, a short-lived server-side idempotency token — issued by the Payment Service and passed back by the caller — would shift key generation to the server and remove the derivation burden from the caller entirely.
