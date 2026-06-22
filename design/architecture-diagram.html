@@ -441,7 +441,8 @@
           <li>stripe.paymentIntents.retrieve(stripe_pi_id)</li>
           <li>UPDATE final status</li>
           <li>Publish PaymentStateChanged to SNS (fallback publisher)</li>
-          <li>Auto-cancel after 24h max-age</li>
+          <li>Cancel on Stripe → mark failed → publish SNS (order matters)</li>
+          <li>Max-age per payment method: card ~1h · 3DS ~24h · ACH ~6d</li>
         </ul>
       </div>
     </div>
