@@ -10,9 +10,17 @@ The outbox row written in the same DB transaction has `enqueued_at = NULL`. The 
 
 ---
 
-**Q: What happens if a worker crashes mid-flight — after calling Stripe but before updating the database?**
+**Q: What happens if a worker crashes mid-flight?**
 
-The SQS visibility timeout saves us. When a worker dequeues a message, SQS hides it from other workers for ~30 seconds. If the worker crashes, it never calls `deleteMessage()`, so after the timeout expires the message becomes visible again and another worker picks it up. That worker calls Stripe again with the same Stripe idempotency key (`{consumer_id}:{idempotency_key}`). Stripe recognizes it and returns the same PaymentIntent result without charging the card again. The worker then writes `succeeded` to the DB and deletes the message. The customer is charged exactly once.
+There are two distinct crash windows — the answer is different for each.
+
+**Window A — crash after calling Stripe, before `deleteMessage()`:**
+The SQS visibility timeout expires (30s), the message is redelivered. The second worker does `UPDATE WHERE status='pending'` → 0 rows (already `processing`). It then checks `stripe_pi_id` — it is set, meaning Stripe was already called. The worker skips the Stripe call and deletes the message. The webhook from Stripe arrives and drives the transition to `succeeded`. Customer charged once.
+
+**Window B — crash after setting `status=processing`, before calling Stripe (`stripe_pi_id` is still NULL):**
+The message is redelivered. The second worker does `UPDATE WHERE status='pending'` → 0 rows. It checks `stripe_pi_id` — it is NULL. NULL means Stripe was never called. The worker proceeds with the Stripe call as if it were the first attempt. Even if two workers race and both see NULL at the same moment, both use the same Stripe idempotency key (`{consumer_id}:{idempotency_key}`) — Stripe deduplicates and returns one PaymentIntent. Customer charged once.
+
+**The sentinel:** `stripe_pi_id` is the key to distinguishing the two windows. Without it, window B would leave the payment permanently stuck in `processing` with no PI to retrieve — neither the webhook nor the Reconciliation Lambda could recover it.
 
 ---
 
@@ -123,9 +131,12 @@ EventBridge (every 5 min)
 
 **Q: A payment is stuck in `processing` for 2 hours. What caused it, and how does your system recover?**
 
-Causes: Stripe is having an incident, the card requires 3DS and the customer never completed it, or a worker crashed after the status was set to `processing` but the Stripe call never actually completed.
+Causes:
+- Stripe is having an incident
+- The card requires 3DS and the customer never completed it
+- A worker crashed after setting `status=processing` but before calling Stripe — however this case is self-healing via the `stripe_pi_id` sentinel (see worker crash Q above) and should not reach the 2-hour mark
 
-Recovery: the Reconciliation Lambda runs every 5 minutes and queries for payments in `processing` older than 10 minutes. For each, it calls `stripe.paymentIntents.retrieve(stripe_pi_id)` and syncs internal status to match:
+Recovery: the Reconciliation Lambda runs every 5 minutes and queries for payments in `processing` older than 10 minutes. For each with a `stripe_pi_id` set, it calls `stripe.paymentIntents.retrieve(stripe_pi_id)` and syncs internal status to match. If `stripe_pi_id` is NULL (crash-before-Stripe that wasn't recovered by SQS redelivery), the Lambda cannot query Stripe and marks the payment `failed` after 24 hours.
 - Stripe says `succeeded` → update to `succeeded`, publish event
 - Stripe says `requires_action` → leave in `processing`, optionally notify consumer
 - Stripe says `canceled` or `payment_failed` → update to `failed`, publish event

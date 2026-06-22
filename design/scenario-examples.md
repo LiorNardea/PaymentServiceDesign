@@ -219,59 +219,81 @@ llc-service          Payment API           DB
 
 ## Scenario 4 — Worker Crashes Mid-Flight
 
-**Business context**: Worker #1 calls Stripe, gets a `succeeded` response, but crashes before calling `deleteMessage()` or updating the DB.
+There are two distinct crash windows with different outcomes.
 
-### Flow
+### 4a — Crash after calling Stripe, before `deleteMessage()`
+
+**Business context**: Worker #1 calls Stripe and gets `succeeded` back, then crashes before deleting the SQS message.
 
 ```
 Worker #1             Stripe               SQS
     │                    │                   │
+    │  UPDATE status=processing, stripe_pi_id=pi_3Nxxx
     │  stripe.create()   │                   │
     │───────────────────▶│                   │
     │  → succeeded       │                   │
     │◀───────────────────│                   │
-    │                    │                   │
-    │  [CRASH]           │                   │
-    │  ✗ never calls     │                   │
-    │    deleteMessage() │                   │
-    │  ✗ never updates   │                   │
-    │    DB              │                   │
-    │                    │                   │
+    │  [CRASH — deleteMessage() never called]│
     │                    │  [30s visibility  │
     │                    │   timeout expires]│
-    │                    │                   │  message becomes
-    │                    │                   │  visible again
+    │                    │                   │  message visible again
 
-Worker #2             Stripe               DB
-    │                    │                   │
-    │  receiveMessage()  │                   │
-    │  → pay_01HABC      │                   │
-    │                    │                   │
-    │  UPDATE payments   │                   │
-    │  SET status=processing                 │
-    │  WHERE status=pending ──────────────▶ │
-    │  → 0 rows affected  │                  │
-    │  (status is already  │                 │
-    │   processing from    │                 │
-    │   Worker #1)         │                 │
-    │                    │                   │
-    │  stripe.create()   │                   │
-    │  [same idempotency key]                │
-    │───────────────────▶│                   │
-    │  → same PaymentIntent│                 │
-    │    status=succeeded  │                 │
-    │    NO second charge  │                 │
-    │◀───────────────────│                   │
-    │  deleteMessage()   │                   │
+Worker #2             DB                  Stripe
+    │                   │                    │
+    │  receiveMessage() │                    │
+    │  UPDATE WHERE status=pending → 0 rows  │
+    │  (already processing)                  │
+    │  SELECT stripe_pi_id → pi_3Nxxx (SET) │
+    │  → Stripe was called, skip Stripe call │
+    │  deleteMessage()  │                    │
+    │                   │                    │
+    │  [Stripe webhook arrives normally]     │
+    │  Webhook Handler: processing→succeeded │
 ```
+
+**Outcome**: customer charged once. Webhook drives the final status update.
+
+---
+
+### 4b — Crash after setting `status=processing`, before calling Stripe
+
+**Business context**: Worker #1 updates the DB to `processing` (`stripe_pi_id` stays NULL), then crashes immediately before the Stripe call.
+
+```
+Worker #1             DB
+    │                   │
+    │  UPDATE status=processing
+    │  stripe_pi_id still NULL
+    │  [CRASH — Stripe never called]
+    │                   │
+    │                   │  message visible again after 30s
+
+Worker #2             DB                  Stripe
+    │                   │                    │
+    │  receiveMessage() │                    │
+    │  UPDATE WHERE status=pending → 0 rows  │
+    │  (already processing)                  │
+    │  SELECT stripe_pi_id → NULL            │
+    │  → Stripe was NOT called, proceed      │
+    │  stripe.create() [same idempotency key]│
+    │──────────────────────────────────────▶│
+    │  → new PaymentIntent created           │
+    │  UPDATE stripe_pi_id=pi_3Nyyy          │
+    │  deleteMessage()  │                    │
+    │                   │                    │
+    │  [Stripe webhook arrives]              │
+    │  Webhook Handler: processing→succeeded │
+```
+
+**Outcome**: customer charged once. `stripe_pi_id` was NULL so the worker knew it was safe to call Stripe.
 
 ### Key points
 
-- The **SQS visibility timeout** (30s) is what saves the job — the message reappears automatically, no manual intervention needed.
-- Worker #2's `UPDATE WHERE status=pending` finds 0 rows (status is already `processing`) — it proceeds anyway because the Stripe idempotency key guarantees no second charge.
-- Stripe returns the **same PaymentIntent** result for the same idempotency key — this is Stripe's own deduplication.
-- The customer is charged exactly **once**, regardless of how many times the worker retried.
-- The Stripe webhook for `payment_intent.succeeded` will still arrive and the Webhook Handler will update the DB to `succeeded` normally.
+- The **`stripe_pi_id` sentinel** is what distinguishes the two crash windows:
+  - `stripe_pi_id IS NULL` → Stripe was never called → retry the call
+  - `stripe_pi_id IS SET` → Stripe was called → skip, wait for webhook
+- Without this check, a crash in window 4b would leave the payment stuck in `processing` with `stripe_pi_id=NULL` permanently — the Reconciliation Lambda cannot recover it because there is no PI to query.
+- Even if two workers race on the NULL check and both call Stripe, the **Stripe idempotency key** (`{consumer_id}:{idempotency_key}`) deduplicates at Stripe's level — one charge, regardless of concurrent calls.
 
 ---
 

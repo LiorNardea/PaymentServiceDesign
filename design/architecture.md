@@ -108,7 +108,7 @@ Consumers get a **synchronous acknowledgement** (HTTP 202 Received + `paymentId`
 
 Accepted payment requests are enqueued **before** any Stripe call. Workers pull jobs and call Stripe. This means:
 - Bursts are smoothed (queue buffers load)
-- A worker crash only drops in-flight processing — the job becomes visible again after the SQS visibility timeout
+- A worker crash leaves the SQS message intact — it reappears after the visibility timeout and is redelivered. The worker uses `stripe_pi_id` as a sentinel on redelivery: `NULL` means Stripe was never called (retry the call); set means Stripe was called (skip and let the webhook arrive). See [failure-modes.md §2](failure-modes.md#2-worker-crashes-mid-flight) for the full breakdown.
 - The queue is the source of durability, not the HTTP thread
 - API tier and Worker tier scale **independently** — add API replicas for request throughput, add Worker replicas for Stripe throughput, tune N for I/O concurrency per worker
 

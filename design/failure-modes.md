@@ -15,19 +15,43 @@
 
 ---
 
-## 2. Worker Crashes After Calling Stripe, Before Updating DB
+## 2. Worker Crashes Mid-Flight
 
-**Scenario**: worker calls `stripe.paymentIntents.confirm()`, Stripe returns `succeeded`, worker crashes before writing `succeeded` to the payments table.
+There are two distinct crash windows, and they are handled differently.
+
+### 2a. Crash after calling Stripe, before updating DB
+
+**Scenario**: worker sets `status=processing`, calls Stripe, gets `succeeded` back, then crashes before writing the final status to the DB.
 
 **How it's handled**:
-1. Queue visibility timeout expires (e.g., 30s). The job is re-delivered.
-2. Worker attempts to call Stripe again with the **same Stripe idempotency key** (derived as `{consumer_id}:{idempotency_key}` — see [data-model.md § Idempotency Key](data-model.md#idempotency-key----ownership-derivation-and-enforcement)).
-3. Stripe returns the same PaymentIntent in `succeeded` state — **no second charge**.
-4. Worker writes `succeeded` to the DB. Customer is charged exactly once.
+1. SQS visibility timeout expires (30s). The message is re-delivered.
+2. Second worker does `UPDATE WHERE status='pending'` → 0 rows (already `processing`).
+3. Worker checks `stripe_pi_id` — it is set (the first worker wrote it before crashing).
+4. Worker concludes Stripe was already called and skips the Stripe call.
+5. Webhook arrives from Stripe and drives the transition to `succeeded`. Customer charged once.
 
-**Alternative scenario**: if the worker crashes *before* calling Stripe, the re-delivery results in a fresh Stripe call with the same idempotency key — same outcome.
+### 2b. Crash after setting `status=processing`, before calling Stripe
 
-> **Bonus code status**: this scenario's queue-redelivery half is now real — `queue.ts` uses actual SQS (via LocalStack) with a genuine visibility timeout, so a worker crash mid-processing does leave the message for redelivery exactly as described above. The remaining gap is narrower than before: there's still no separate outbox relay process, so the one window this doesn't cover is a crash between the DB insert and the inline `queue.enqueue()` call itself — if that exact line never runs, the payment sits in `pending` with no message in SQS at all. See the "Design vs. bonus code" table in the [root README](../README.md).
+**Scenario**: worker updates `status=processing` (and `stripe_pi_id` is still NULL), then crashes immediately — Stripe was never called.
+
+**Why this is the harder case**: the SQS message is re-delivered, but the second worker does `UPDATE WHERE status='pending'` → 0 rows. Without the `stripe_pi_id` check it would skip the job entirely, leaving the payment stuck in `processing` with `stripe_pi_id=NULL` forever — the Reconciliation Lambda cannot recover it because there is no PI to retrieve.
+
+**How it's handled**:
+The worker uses `stripe_pi_id` as a sentinel to distinguish the two cases:
+
+```
+UPDATE payments SET status='processing' WHERE id=$id AND status='pending'
+→ 0 rows affected (already processing)
+
+SELECT stripe_pi_id FROM payments WHERE id=$id
+→ NULL   → Stripe was never called → proceed with the Stripe call
+→ SET    → Stripe was called → skip, webhook will arrive
+```
+
+If `stripe_pi_id IS NULL`, the worker calls Stripe as if it were the first attempt. Stripe returns a new PaymentIntent (no prior call was made), and processing continues normally.
+
+**What prevents a double charge if two workers race on the NULL check?**
+Both workers would call Stripe, but both use the same Stripe idempotency key (`{consumer_id}:{idempotency_key}`). Stripe deduplicates and returns the same PaymentIntent — one charge, regardless of how many concurrent Stripe calls are made.
 
 ---
 
