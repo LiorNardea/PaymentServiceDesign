@@ -401,7 +401,7 @@ EventBridge (cron)    Reconciliation Lambda  DB              Stripe
 - **Worst-case lag**: the payment can sit in `processing` for up to 10 min (threshold) + 5 min (Lambda interval) = **15 minutes** before reconciliation fixes it.
 - The Reconciliation Lambda is the **fallback publisher** — it publishes to SNS exactly as the Webhook Handler would have. Subscribers receive the event and act normally.
 - If Stripe returns `requires_action` (3DS pending), the Lambda leaves the payment in `processing` and tries again on the next cycle.
-- After **24 hours** in `processing`, the Lambda auto-cancels the PaymentIntent on Stripe and marks the payment `failed`.
+- After a configurable max-age **per payment method** (e.g. 1h for plain cards, 24h for 3DS, 6 days for ACH), the Lambda **cancels the PaymentIntent on Stripe first**, then marks the payment `failed` locally and publishes to SNS. Stripe does not guarantee a fixed settlement window — cancelling too early aborts a legitimate in-progress payment; too late risks holding funds indefinitely. The order (Stripe cancel → DB update → SNS) prevents a double-charge if the consumer retried after seeing `failed`.
 
 ---
 

@@ -210,7 +210,7 @@ Both layers are independent. Either one alone would prevent a duplicate; togethe
 
 **Who publishes:** the **Webhook Handler** is the sole publisher of final-state `PaymentStateChanged` events. The Worker does not publish — its job ends after transitioning the payment to `processing` and calling Stripe. The final state (`succeeded` / `failed`) is confirmed by Stripe via webhook, and only then is the event published.
 
-The one exception is the **Reconciliation Lambda**: if a webhook is missed entirely (Stripe delivery failure or service downtime), it detects the stale `processing` state, syncs from Stripe directly, and publishes the `PaymentStateChanged` event itself — so downstream services are notified even when the normal webhook path fails.
+The one exception is the **Reconciliation Lambda**: if a webhook is missed entirely (Stripe delivery failure or service downtime), it detects the stale `processing` state, syncs from Stripe directly, and publishes the `PaymentStateChanged` event itself. For payments stuck beyond a configurable max-age **per payment method** (cards ~1h, 3DS ~24h, ACH ~6 days — Stripe does not guarantee a fixed window), it **cancels the PaymentIntent on Stripe first**, then marks `failed` locally and publishes — the order is critical to prevent a double-charge if the consumer retried after receiving a `failed` event while Stripe was still able to settle the charge.
 
 **Deployment model — scheduled Lambda, not an always-running service.**
 The Reconciliation Lambda is triggered by an **AWS EventBridge scheduled rule** every 5 minutes. It runs, does its work, and exits. It is not a long-running process. Reasons:

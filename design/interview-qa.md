@@ -191,7 +191,11 @@ For each stale payment it finds, it calls `stripe.paymentIntents.retrieve(stripe
 | `requires_action` | Leave in `processing` (3DS pending) · optionally notify the consumer to prompt the customer |
 | Stripe API unavailable | Log, skip this payment, retry on the next reconciliation cycle |
 
-After a configurable max-age (e.g. 24 hours), the job auto-cancels the PaymentIntent on Stripe and marks the payment `failed` to prevent it from hanging indefinitely.
+After a configurable max-age **per payment method**, the job **cancels the PaymentIntent on Stripe first**, then marks the payment `failed` locally and publishes `PaymentStateChanged { newStatus: failed }` to SNS.
+
+**Why the order matters**: marking `failed` locally before cancelling on Stripe creates a window where our DB says `failed` but Stripe might still complete the charge. The consumer receives a `failed` event, retries, and the customer gets charged twice. Cancelling on Stripe first closes that window — the PaymentIntent is terminal on Stripe's side before we ever tell anyone it failed.
+
+**Why not a fixed 24-hour cutoff**: Stripe does not guarantee a fixed settlement window. It depends on the payment method — cards settle in seconds, 3DS can take hours (waiting for customer action), ACH takes 1–5 business days. A single hardcoded timeout would either abort legitimate in-progress payments (too short) or hold funds indefinitely (too long). The timeout is stored per payment row and driven by the payment method used.
 
 **Why this matters:** Stripe guarantees at-least-once webhook delivery with retries for up to 3 days — but our service could be down during that window, or the webhook could be lost. The Reconciliation Lambda means no payment can be stuck in `processing` forever regardless of what happens to the webhook delivery. It is the safety net that makes the async design reliable end-to-end.
 

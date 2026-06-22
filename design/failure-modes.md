@@ -123,7 +123,20 @@ The second webhook returns `200 OK` without re-processing. The status update is 
   - If `requires_action` (3DS pending): leave in `processing`, extend timeout, optionally notify consumer.
   - If `canceled` or `payment_failed`: update to `failed`, publish `PaymentStateChanged` to SNS.
   - If Stripe API itself is down: log and skip; the Lambda will retry on its next scheduled invocation.
-- After a configurable max-age (e.g., 24h), auto-cancel the PaymentIntent on Stripe and mark `failed`.
+- After a configurable max-age **appropriate for the payment method**, the Lambda **cancels the PaymentIntent on Stripe first**, then marks the payment `failed` locally and publishes `PaymentStateChanged { newStatus: failed }` to SNS.
+
+**Why cancel on Stripe before marking failed**: if we mark `failed` locally first and Stripe later completes the charge, the customer is charged but our DB says `failed`. The consumer would never receive a `succeeded` event and might retry — causing a double charge. Cancelling on Stripe first ensures the PaymentIntent can never settle after we declare it failed.
+
+**Why the timeout is payment-method-dependent**: Stripe does not guarantee a fixed settlement window — it varies by payment method:
+
+| Payment method | Typical settlement | Suggested timeout |
+|---|---|---|
+| Card (no 3DS) | Seconds–minutes | 1 hour |
+| Card with 3DS | Up to customer action | 24 hours |
+| ACH / bank transfer | 1–5 business days | 6 days |
+| SEPA Direct Debit | 2–3 business days | 4 days |
+
+Cancelling too early risks aborting a legitimate in-progress payment (e.g. a customer who hasn't completed 3DS yet). The timeout should be stored per payment row and driven by the payment method, not hardcoded globally.
 
 ---
 
