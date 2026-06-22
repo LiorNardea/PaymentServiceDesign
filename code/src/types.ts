@@ -55,3 +55,13 @@ export interface QueueJob {
   enqueuedAt: Date;
   attempts: number;
 }
+
+export interface PaymentEvent {
+  id: string;
+  paymentId: string;
+  eventType: string;
+  fromStatus?: PaymentStatus;
+  toStatus?: PaymentStatus;
+  payload?: Record<string, unknown>;
+  createdAt: Date;
+}

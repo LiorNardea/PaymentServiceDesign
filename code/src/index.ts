@@ -1,16 +1,19 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { ulid } from 'ulid';
 import { createPayment, getPayment, createRefund } from './payment-service';
-import { handleStripeWebhook } from './webhook-handler';
+import { handleStripeWebhook, processStripeEvent, StripeWebhookEvent } from './webhook-handler';
 import { startWorker } from './worker';
+import { startOutboxRelay } from './outbox-relay';
+import { startReconciliation, runReconciliation } from './reconciliation';
 import { stripe } from './stripe-mock';
 import { db } from './db';
+import { ulid } from 'ulid';
 
 const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
 // POST /payments — initiate a charge
+// Returns 202 Received for new payments; 200 for idempotent replays.
 // ---------------------------------------------------------------------------
 app.post('/payments', async (req: Request, res: Response) => {
   const { consumerId, idempotencyKey, customerId, amount, currency, description, metadata } = req.body;
@@ -21,6 +24,7 @@ app.post('/payments', async (req: Request, res: Response) => {
   }
 
   const payment = await createPayment({ consumerId, idempotencyKey, customerId, amount, currency, description, metadata });
+  // 202 for new payments, 200 for idempotent replay (existing row returned)
   const statusCode = payment.status === 'pending' ? 202 : 200;
   res.status(statusCode).json(payment);
 });
@@ -38,7 +42,7 @@ app.get('/payments/:id', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /payments/:id/refund — initiate a refund
+// POST /payments/:id/refund — initiate a refund (only for succeeded payments)
 // ---------------------------------------------------------------------------
 app.post('/payments/:id/refund', async (req: Request, res: Response) => {
   const { idempotencyKey, amount, reason } = req.body;
@@ -57,9 +61,40 @@ app.post('/payments/:id/refund', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /payments — admin / reconciliation query
+// Query params: status, consumerId, limit (default 50), cursor (updated_at ISO string)
+// ---------------------------------------------------------------------------
+app.get('/payments', async (req: Request, res: Response) => {
+  const { status, consumerId, limit = '50', cursor } = req.query;
+
+  if (status && !['pending', 'processing', 'succeeded', 'failed', 'refund_pending', 'refunded', 'refund_failed'].includes(status as string)) {
+    res.status(400).json({ error: 'invalid status' });
+    return;
+  }
+
+  const payments = await db.queryPayments({
+    status: status as string | undefined,
+    consumerId: consumerId as string | undefined,
+    limit: Math.min(parseInt(limit as string, 10) || 50, 200),
+    cursor: cursor as string | undefined,
+  });
+
+  res.json({ payments, count: payments.length });
+});
+
+// ---------------------------------------------------------------------------
 // POST /webhooks/stripe — Stripe async event delivery
+// Not callable by internal services — Stripe only.
 // ---------------------------------------------------------------------------
 app.post('/webhooks/stripe', handleStripeWebhook);
+
+// ---------------------------------------------------------------------------
+// POST /reconcile — manually trigger reconciliation (useful for demo/testing)
+// ---------------------------------------------------------------------------
+app.post('/reconcile', async (_req: Request, res: Response) => {
+  await runReconciliation();
+  res.json({ ok: true });
+});
 
 // ---------------------------------------------------------------------------
 // Global error handler
@@ -75,47 +110,29 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // ---------------------------------------------------------------------------
 const PORT = process.env.PORT ?? 3000;
 
-// Wire the mock Stripe webhook callback to simulate Stripe calling our endpoint.
-// Each event gets a globally-unique id (ulid) — using Date.now() here previously caused
-// id collisions under concurrent load (multiple events landing in the same millisecond),
-// which made the dedup check in markWebhookProcessed() silently drop real events.
+// Wire the mock Stripe callback to the real processStripeEvent function.
+// This ensures the mock and the real HTTP webhook path share identical logic —
+// no duplicate status-update code here.
 stripe.registerWebhookCallback((event) => {
   void (async () => {
-    const stripeEvent = {
+    const stripeEvent: StripeWebhookEvent = {
       id: `evt_mock_${ulid()}`,
       type: event.type,
-      data: event.data,
+      data: { object: event.data.object as Record<string, unknown> },
     };
-
-    const isNew = await db.markWebhookProcessed(stripeEvent.id, stripeEvent.type);
-    if (!isNew) return;
-
-    const obj = stripeEvent.data.object as Record<string, unknown>;
-
-    if (stripeEvent.type === 'payment_intent.succeeded') {
-      const meta = obj['metadata'] as Record<string, string> | undefined;
-      const paymentId = meta?.['paymentId'];
-      if (paymentId) {
-        await db.updatePaymentStatus(paymentId, 'processing', { status: 'succeeded' });
-        console.log(`[stripe-mock webhook] ${paymentId} → succeeded`);
-      }
-    } else if (stripeEvent.type === 'charge.refunded') {
-      const piId = obj['payment_intent'] as string | undefined;
-      if (piId) {
-        const allPending = await db.getPaymentsByStatus('refund_pending');
-        const p = allPending.find((pay) => pay.stripePiId === piId);
-        if (p) {
-          await db.forceUpdatePayment(p.id, { status: 'refunded' });
-          console.log(`[stripe-mock webhook] ${p.id} → refunded`);
-        }
-      }
-    }
+    await processStripeEvent(stripeEvent);
   })();
 });
 
 startWorker();
+startOutboxRelay();
+startReconciliation();
 
 app.listen(PORT, () => {
   console.log(`[server] Payment Service running on :${PORT}`);
-  console.log(`[server] Try: curl -X POST http://localhost:${PORT}/payments -H 'Content-Type: application/json' -d '{"consumerId":"llc-service","idempotencyKey":"test-1","customerId":"cust_123","amount":5000,"currency":"usd"}'`);
+  console.log(`[server] POST /payments  → initiate charge`);
+  console.log(`[server] GET  /payments/:id → poll status`);
+  console.log(`[server] POST /payments/:id/refund → refund`);
+  console.log(`[server] GET  /payments → admin query (?status=processing&consumerId=llc-service)`);
+  console.log(`[server] POST /reconcile → trigger reconciliation manually`);
 });

@@ -1,11 +1,17 @@
 /**
  * Core payment service — business logic layer.
- * Orchestrates DB writes, outbox, and queue enqueue atomically.
+ *
+ * Responsibilities:
+ *   - Validate the request
+ *   - Write payments + outbox rows atomically (single DB transaction in production)
+ *   - Return 202 immediately — no Stripe calls happen here
+ *
+ * The outbox relay (outbox-relay.ts) is the only component that enqueues jobs.
+ * This service never calls queue.enqueue() directly.
  */
 import { ulid } from 'ulid';
 import { CreatePaymentRequest, CreateRefundRequest, Payment } from './types';
 import { db } from './db';
-import { queue } from './queue';
 
 export async function createPayment(req: CreatePaymentRequest): Promise<Payment> {
   const id = `pay_${ulid()}`;
@@ -25,28 +31,24 @@ export async function createPayment(req: CreatePaymentRequest): Promise<Payment>
     updatedAt: now,
   };
 
-  // Atomic write: in production this is a single DB transaction that also
-  // inserts an outbox row.
+  // In production: both inserts happen in a single DB transaction so a crash
+  // between them is impossible — either both rows exist or neither does.
   const inserted = await db.insertPayment(payment);
 
-  // If inserted.id !== id, the idempotency key was already used — return existing.
+  // If id differs, the idempotency key already existed — return existing row.
   if (inserted.id !== id) {
     return inserted;
   }
 
-  // Write outbox entry (in production: same transaction as insertPayment)
   await db.insertOutboxEntry({
-    id: ulid(),
+    id: `ob_${ulid()}`,
     paymentId: id,
     payload: { type: 'charge', paymentId: id },
     createdAt: now,
   });
 
-  // In production: an outbox relay reads this entry and calls queue.enqueue().
-  // Here we call it inline for simplicity — see design/data-model.md's
-  // "Note on the bonus code" for why this differs from the production design.
-  await queue.enqueue(id, 'charge');
-  console.log(`[payment-service] created ${id} for ${req.consumerId}`);
+  // The outbox relay will pick this up within ~200ms and enqueue it to SQS.
+  console.log(`[payment-service] created ${id} for ${req.consumerId} — outbox relay will enqueue`);
 
   return inserted;
 }
@@ -62,21 +64,18 @@ export async function createRefund(paymentId: string, req: CreateRefundRequest):
     throw new Error(`Cannot refund payment in status: ${payment.status}`);
   }
 
-  // Atomic transition: succeeded → refund_pending
-  const moved = await db.updatePaymentStatus(paymentId, 'succeeded', {
-    status: 'refund_pending',
-  });
+  // Atomic optimistic transition: succeeded → refund_pending
+  const moved = await db.updatePaymentStatus(paymentId, 'succeeded', { status: 'refund_pending' });
   if (!moved) throw new Error('Payment status changed concurrently — retry');
 
   await db.insertOutboxEntry({
-    id: ulid(),
+    id: `ob_${ulid()}`,
     paymentId,
     payload: { type: 'refund', paymentId, idempotencyKey: req.idempotencyKey },
     createdAt: new Date(),
   });
 
-  await queue.enqueue(paymentId, 'refund');
-  console.log(`[payment-service] refund enqueued for ${paymentId}`);
+  console.log(`[payment-service] refund requested for ${paymentId} — outbox relay will enqueue`);
 
   return (await db.getPayment(paymentId))!;
 }

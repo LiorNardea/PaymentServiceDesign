@@ -3,7 +3,7 @@
  * Connects to a local MySQL instance (DATABASE_URL env var, defaults below).
  */
 import mysql from 'mysql2/promise';
-import { Payment, OutboxEntry } from './types';
+import { Payment, OutboxEntry, PaymentEvent } from './types';
 
 const pool = mysql.createPool(
   process.env.DATABASE_URL ?? 'mysql://root@localhost:3306/payment_service',
@@ -102,6 +102,71 @@ class MySqlDb {
 
   async getPaymentsByStatus(status: Payment['status']): Promise<Payment[]> {
     const [rows] = await pool.execute(`SELECT * FROM payments WHERE status = ?`, [status]);
+    return (rows as any[]).map(rowToPayment);
+  }
+
+  async getPaymentByStripePiId(stripePiId: string): Promise<Payment | undefined> {
+    const [rows] = await pool.execute(`SELECT * FROM payments WHERE stripe_pi_id = ?`, [stripePiId]);
+    const row = (rows as any[])[0];
+    return row ? rowToPayment(row) : undefined;
+  }
+
+  async getRefundPendingByParentId(parentPaymentId: string): Promise<Payment | undefined> {
+    const [rows] = await pool.execute(
+      `SELECT * FROM payments WHERE parent_payment_id = ? AND status = 'refund_pending' LIMIT 1`,
+      [parentPaymentId],
+    );
+    const row = (rows as any[])[0];
+    return row ? rowToPayment(row) : undefined;
+  }
+
+  // Payments stuck in processing longer than `minutes` — used by reconciliation.
+  async getStaleProcessingPayments(minutes: number): Promise<Payment[]> {
+    const [rows] = await pool.execute(
+      `SELECT * FROM payments WHERE status = 'processing' AND updated_at < DATE_SUB(NOW(3), INTERVAL ? MINUTE)`,
+      [minutes],
+    );
+    return (rows as any[]).map(rowToPayment);
+  }
+
+  // ---------- payment_events ----------
+
+  async insertPaymentEvent(event: PaymentEvent): Promise<void> {
+    await pool.execute(
+      `INSERT INTO payment_events (id, payment_id, event_type, from_status, to_status, payload, created_at)
+       VALUES (?,?,?,?,?,?,?)`,
+      [
+        event.id,
+        event.paymentId,
+        event.eventType,
+        event.fromStatus ?? null,
+        event.toStatus ?? null,
+        event.payload ? JSON.stringify(event.payload) : null,
+        event.createdAt,
+      ],
+    );
+  }
+
+  async queryPayments(opts: {
+    status?: string;
+    consumerId?: string;
+    limit: number;
+    cursor?: string; // updated_at ISO string — returns rows updated before this timestamp
+  }): Promise<Payment[]> {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (opts.status) { conditions.push('status = ?'); params.push(opts.status); }
+    if (opts.consumerId) { conditions.push('consumer_id = ?'); params.push(opts.consumerId); }
+    if (opts.cursor) { conditions.push('updated_at < ?'); params.push(new Date(opts.cursor)); }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(opts.limit);
+
+    const [rows] = await pool.execute(
+      `SELECT * FROM payments ${where} ORDER BY updated_at DESC LIMIT ?`,
+      params as any,
+    );
     return (rows as any[]).map(rowToPayment);
   }
 

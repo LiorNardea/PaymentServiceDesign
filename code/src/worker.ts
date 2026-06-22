@@ -1,7 +1,10 @@
 /**
  * Queue worker — processes charge and refund jobs.
  * In production: multiple worker processes each polling SQS independently.
+ * Each worker maintains a semaphore of N concurrent in-flight Stripe calls
+ * (sliding window — not a batch). Here N=1 for the skeleton.
  */
+import { ulid } from 'ulid';
 import { QueueJob, Payment } from './types';
 import { db } from './db';
 import { stripe } from './stripe-mock';
@@ -22,11 +25,9 @@ async function processJob(job: QueueJob): Promise<void> {
 }
 
 async function processCharge(job: QueueJob, payment: Payment): Promise<void> {
-  // Atomic transition: pending → processing
-  // Guards against concurrent workers or double-delivery
-  const moved = await db.updatePaymentStatus(payment.id, 'pending', {
-    status: 'processing',
-  });
+  // Optimistic lock: only one worker can claim a pending job.
+  // Guards against concurrent workers or duplicate SQS delivery.
+  const moved = await db.updatePaymentStatus(payment.id, 'pending', { status: 'processing' });
   if (!moved) {
     console.log(`[worker] ${payment.id} already past pending — skipping`);
     return;
@@ -43,21 +44,50 @@ async function processCharge(job: QueueJob, payment: Payment): Promise<void> {
       metadata: { paymentId: payment.id, consumerId: payment.consumerId },
     });
 
-    // Record the Stripe PI id so webhook handler and reconciliation can look it up
+    // Write stripe_pi_id atomically with the processing transition so the
+    // Webhook Handler and Reconciliation can resolve this payment by PI id.
     await db.forceUpdatePayment(payment.id, { stripePiId: pi.id });
+
+    await db.insertPaymentEvent({
+      id: `pe_${ulid()}`,
+      paymentId: payment.id,
+      eventType: 'stripe_charge_initiated',
+      fromStatus: 'pending',
+      toStatus: 'processing',
+      payload: { stripePiId: pi.id, stripeStatus: pi.status },
+      createdAt: new Date(),
+    });
+
     console.log(`[worker] ${payment.id} → stripe PI ${pi.id} created (status: ${pi.status})`);
 
-    // If Stripe returns synchronous confirmation (rare but possible for some payment methods)
+    // Synchronous confirmation (rare). Normally the webhook drives this transition.
     if (pi.status === 'succeeded') {
       await db.updatePaymentStatus(payment.id, 'processing', { status: 'succeeded' });
+      await db.insertPaymentEvent({
+        id: `pe_${ulid()}`,
+        paymentId: payment.id,
+        eventType: 'status_changed',
+        fromStatus: 'processing',
+        toStatus: 'succeeded',
+        payload: { source: 'stripe_sync_response' },
+        createdAt: new Date(),
+      });
       console.log(`[worker] ${payment.id} → succeeded (sync)`);
     }
-    // Otherwise, webhook will drive the next transition
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     await db.forceUpdatePayment(payment.id, { status: 'failed', failureReason: reason });
+    await db.insertPaymentEvent({
+      id: `pe_${ulid()}`,
+      paymentId: payment.id,
+      eventType: 'stripe_charge_failed',
+      fromStatus: 'processing',
+      toStatus: 'failed',
+      payload: { reason },
+      createdAt: new Date(),
+    });
     console.error(`[worker] ${payment.id} → failed: ${reason}`);
-    throw err; // let queue handle retry logic
+    throw err; // let queue handle redelivery
   }
 }
 
@@ -68,21 +98,47 @@ async function processRefund(job: QueueJob, payment: Payment): Promise<void> {
   }
 
   if (!payment.stripePiId) {
-    await db.forceUpdatePayment(payment.id, { status: 'refund_failed', failureReason: 'no stripe PI id' });
-    return;
+    // Look up the original payment's PI id via parent_payment_id
+    const original = payment.parentPaymentId ? await db.getPayment(payment.parentPaymentId) : undefined;
+    if (!original?.stripePiId) {
+      await db.forceUpdatePayment(payment.id, { status: 'refund_failed', failureReason: 'no stripe PI id' });
+      return;
+    }
+    // Set stripe_pi_id on the refund row so charge.refunded webhook can find it
+    await db.forceUpdatePayment(payment.id, { stripePiId: original.stripePiId });
+    payment = { ...payment, stripePiId: original.stripePiId };
   }
 
   try {
     await stripe.createRefund({
-      paymentIntentId: payment.stripePiId,
+      paymentIntentId: payment.stripePiId!,
       amount: payment.amount,
       idempotencyKey: `refund:${payment.id}`,
     });
-    console.log(`[worker] ${payment.id} → refund initiated on Stripe`);
+
+    await db.insertPaymentEvent({
+      id: `pe_${ulid()}`,
+      paymentId: payment.id,
+      eventType: 'stripe_refund_initiated',
+      fromStatus: 'refund_pending',
+      payload: { stripePiId: payment.stripePiId },
+      createdAt: new Date(),
+    });
+
+    console.log(`[worker] ${payment.id} → refund initiated on Stripe (PI: ${payment.stripePiId})`);
     // Webhook drives the final transition to 'refunded'
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     await db.forceUpdatePayment(payment.id, { status: 'refund_failed', failureReason: reason });
+    await db.insertPaymentEvent({
+      id: `pe_${ulid()}`,
+      paymentId: payment.id,
+      eventType: 'stripe_refund_failed',
+      fromStatus: 'refund_pending',
+      toStatus: 'refund_failed',
+      payload: { reason },
+      createdAt: new Date(),
+    });
     console.error(`[worker] ${payment.id} → refund failed: ${reason}`);
     throw err;
   }
