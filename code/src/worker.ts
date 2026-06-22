@@ -26,11 +26,18 @@ async function processJob(job: QueueJob): Promise<void> {
 
 async function processCharge(job: QueueJob, payment: Payment): Promise<void> {
   // Optimistic lock: only one worker can claim a pending job.
-  // Guards against concurrent workers or duplicate SQS delivery.
   const moved = await db.updatePaymentStatus(payment.id, 'pending', { status: 'processing' });
   if (!moved) {
-    console.log(`[worker] ${payment.id} already past pending — skipping`);
-    return;
+    // Already processing — check stripe_pi_id to distinguish two crash windows:
+    //   stripe_pi_id IS SET  → Stripe was called before crash → skip, webhook will arrive
+    //   stripe_pi_id IS NULL → Stripe was never called → must proceed with the call
+    const current = await db.getPayment(payment.id);
+    if (current?.stripePiId) {
+      console.log(`[worker] ${payment.id} already processing with PI ${current.stripePiId} — skipping`);
+      return;
+    }
+    console.log(`[worker] ${payment.id} processing but stripe_pi_id is NULL — crash before Stripe, retrying call`);
+    // Fall through and call Stripe below
   }
 
   const stripeIdempotencyKey = `${payment.consumerId}:${payment.idempotencyKey}`;
